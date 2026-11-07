@@ -7,6 +7,7 @@
 
 #include <expat.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -215,6 +216,13 @@ struct StructurePass {
   bool inBody = false;
   bool sawRoot = false;
   char rootName[32] = {};
+  // Set by the caller to allow the parse to stop at the first <binary>:
+  // everything structure-relevant precedes the binaries, and their base64
+  // payloads cannot contain '<', so the remaining registry entries are
+  // collected by a raw substring scan of the file tail (RawBinaryScanner).
+  XML_Parser parser = nullptr;
+  bool binaryScanRequested = false;
+  uint64_t binaryStartByte = 0;  // markup start of the first <binary> tag
   std::vector<BinaryInfo> binaries;
   std::vector<IdTarget> idTargets;
 
@@ -225,6 +233,15 @@ struct StructurePass {
     strncpy(t.id, id, sizeof(t.id) - 1);
     t.chapter = chapterCursor;
     return true;
+  }
+
+  void recordBinary(const char* id, const char* ct) {
+    if (!id || !id[0] || !ct || !ct[0] || binaries.size() >= kMaxBinaries) return;
+    BinaryInfo b;
+    strncpy(b.id, id, sizeof(b.id) - 1);
+    strncpy(b.ext, imageExtensionForContentType(ct), sizeof(b.ext) - 1);
+    if (findBinary(b.id) >= 0) return;  // raw tail scan may re-see a tag; compare truncated
+    binaries.push_back(b);
   }
 
   int32_t findIdChapter(const char* id) const {
@@ -261,13 +278,7 @@ inline void structureElement(StructurePass& s, const char* ln, const char** attr
   }
   if (!s.inBody) {
     if (start && strcmp(ln, "binary") == 0) {
-      const char* id = findAttr(attrs, "id");
-      const char* ct = findAttr(attrs, "content-type");
-      if (id && ct && s.binaries.size() < kMaxBinaries) {
-        BinaryInfo& b = s.binaries.emplace_back();
-        strncpy(b.id, id, sizeof(b.id) - 1);
-        strncpy(b.ext, imageExtensionForContentType(ct), sizeof(b.ext) - 1);
-      }
+      s.recordBinary(findAttr(attrs, "id"), findAttr(attrs, "content-type"));
     }
     return;
   }
@@ -292,12 +303,20 @@ inline void structureElement(StructurePass& s, const char* ln, const char** attr
 
 inline void XMLCALL structStart(void* userData, const XML_Char* name, const char** attrs) {
   StructurePass& s = *static_cast<StructurePass*>(userData);
+  const char* ln = localName(name);
   s.depth++;
   if (!s.sawRoot) {
     s.sawRoot = true;
-    snprintf(s.rootName, sizeof(s.rootName), "%s", localName(name));
+    snprintf(s.rootName, sizeof(s.rootName), "%s", ln);
   }
-  structureElement(s, localName(name), attrs, true);
+  structureElement(s, ln, attrs, true);
+  if (!s.binaryScanRequested && !s.inBody && s.parser && strcmp(ln, "binary") == 0) {
+    // First binary reached: nothing structure-relevant follows in XML terms,
+    // so the expensive parse of the base64 tail is skipped entirely.
+    s.binaryScanRequested = true;
+    s.binaryStartByte = static_cast<uint64_t>(XML_GetCurrentByteIndex(s.parser));
+    XML_StopParser(s.parser, XML_FALSE);
+  }
 }
 
 inline void XMLCALL structEnd(void* userData, const XML_Char* name) {
@@ -305,5 +324,118 @@ inline void XMLCALL structEnd(void* userData, const XML_Char* name) {
   structureElement(s, localName(name), nullptr, false);
   s.depth--;
 }
+
+// ---------------------------------------------------- raw binary tail scan ---
+// After the expat pass stops at the first <binary>, the rest of the registry
+// is collected without XML parsing: base64 payloads contain no '<', so every
+// remaining "<binary" occurrence preceded by whitespace or '>' is a real tag
+// (attribute values cannot hold a raw '<' either). Malformed lookalikes inside
+// comments are a theoretical false positive; an unused registry entry only
+// costs a stale OPF manifest line, and the emission pass looks binaries up by
+// id, so real entries keep consistent indices.
+
+// Extract an attribute value from a tag body (text between "<binary" and '>').
+// Both quote styles are accepted. Returns false when the attribute is absent.
+inline bool rawTagAttr(const char* tag, size_t len, const char* name, std::string& out) {
+  const size_t nameLen = strlen(name);
+  for (size_t i = 0; i + nameLen < len; i++) {
+    if (i > 0 && tag[i - 1] != ' ' && tag[i - 1] != '\t' && tag[i - 1] != '\r' && tag[i - 1] != '\n') continue;
+    if (strncmp(tag + i, name, nameLen) != 0) continue;
+    size_t j = i + nameLen;
+    while (j < len && (tag[j] == ' ' || tag[j] == '\t')) j++;
+    if (j >= len || tag[j] != '=') continue;  // prefix of a longer attr name
+    j++;
+    while (j < len && (tag[j] == ' ' || tag[j] == '\t')) j++;
+    if (j >= len || (tag[j] != '"' && tag[j] != '\'')) continue;
+    const char quote = tag[j++];
+    const size_t valueStart = j;
+    while (j < len && tag[j] != quote) j++;
+    if (j >= len) return false;
+    out.assign(tag + valueStart, j - valueStart);
+    return true;
+  }
+  return false;
+}
+
+constexpr size_t kNpos = static_cast<size_t>(-1);
+
+// Find the next complete "<binary ...>" tag in data[0,len) at or after `from`.
+// Returns the offset just past '>', fills id/contentType; kNpos when no
+// complete tag remains (an incomplete tag at the end waits for more data).
+inline size_t rawFindBinaryTag(const char* data, size_t len, size_t from, std::string& id, std::string& contentType) {
+  constexpr char kSig[] = "<binary";
+  constexpr size_t kSigLen = sizeof(kSig) - 1;
+  size_t p = from;
+  while (p + kSigLen <= len) {
+    const void* hit = memchr(data + p, '<', len - p);
+    if (!hit) return kNpos;
+    p = static_cast<const char*>(hit) - data;
+    if (p + kSigLen > len) return kNpos;
+    if (memcmp(data + p, kSig, kSigLen) != 0) {
+      p++;
+      continue;
+    }
+    if (p > 0) {
+      const char before = data[p - 1];
+      if (before != ' ' && before != '\t' && before != '\r' && before != '\n' && before != '>') {
+        p += kSigLen;
+        continue;
+      }
+    }
+    const size_t tagBody = p + kSigLen;
+    if (tagBody >= len) return kNpos;  // signature straddles the window end
+    const char after = data[tagBody];
+    if (after != ' ' && after != '\t' && after != '\r' && after != '\n' && after != '>') {
+      p = tagBody;  // "<binaryfoo" is not a binary tag
+      continue;
+    }
+    const void* gt = memchr(data + tagBody, '>', len - tagBody);
+    if (!gt) return kNpos;  // incomplete: more data may follow
+    const size_t tagEnd = static_cast<const char*>(gt) - data;
+    if (rawTagAttr(data + tagBody, tagEnd - tagBody, "id", id) &&
+        rawTagAttr(data + tagBody, tagEnd - tagBody, "content-type", contentType)) {
+      return tagEnd + 1;
+    }
+    p = tagEnd + 1;  // a <binary> without id/content-type is useless; keep scanning
+  }
+  return kNpos;
+}
+
+// Incremental scanner for the raw tail: feed() file chunks, finish() once at
+// EOF. A tag straddling a chunk boundary is recovered via the carry window;
+// tags already recorded by the expat pass are skipped by id (recordBinary).
+struct RawBinaryScanner {
+  // Long enough for any sane "<binary ...>" tag; a longer malformed tag cut
+  // exactly at the window edge would be dropped (its image then 404s silently).
+  static constexpr size_t kCarryBytes = 1024;
+
+  void feed(const char* data, size_t len, StructurePass& st) {
+    carry.append(data, len);
+    scan(st, false);
+  }
+
+  void finish(StructurePass& st) {
+    scan(st, true);
+    carry.clear();
+  }
+
+ private:
+  void scan(StructurePass& st, bool flush) {
+    std::string id;
+    std::string contentType;
+    size_t from = 0;
+    for (;;) {
+      const size_t next = rawFindBinaryTag(carry.data(), carry.size(), from, id, contentType);
+      if (next == kNpos) break;
+      st.recordBinary(id.c_str(), contentType.c_str());
+      from = next;
+    }
+    if (flush) return;
+    const size_t keepFrom = carry.size() > kCarryBytes ? carry.size() - kCarryBytes : 0;
+    if (keepFrom > 0) carry.erase(0, keepFrom);
+  }
+
+  std::string carry;
+};
 
 }  // namespace fb2passes

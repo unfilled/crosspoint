@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <expat.h>
+#include <memory>
 
 #include "Base64Decoder.h"
 #include "Fb2Encoding.h"
@@ -19,7 +20,7 @@ namespace {
 
 using namespace fb2passes;  // parsing passes (Fb2Passes.h); emission stays here
 
-constexpr size_t kReadChunk = 16384;
+constexpr size_t kReadChunk = 32768;
 constexpr size_t kMaxNavTitleLen = 96;
 
 bool parseFile(const std::string& path, XML_Parser p, std::string& error, const bool tolerateAbort = false) {
@@ -28,11 +29,17 @@ bool parseFile(const std::string& path, XML_Parser p, std::string& error, const 
     error = "cannot open file";
     return false;
   }
-  static char buf[kReadChunk];
+  // Heap, not static: conversion-time memory the reader gets back afterwards.
+  const std::unique_ptr<char[]> buf(new (std::nothrow) char[kReadChunk]);
+  if (!buf) {
+    error = "out of memory";
+    f.close();
+    return false;
+  }
   bool ok = true;
   size_t total = 0;
   for (;;) {
-    const int n = f.read(buf, sizeof(buf));
+    const int n = f.read(buf.get(), kReadChunk);
     if (n < 0) {
       error = "read error";
       ok = false;
@@ -40,7 +47,7 @@ bool parseFile(const std::string& path, XML_Parser p, std::string& error, const 
     }
     const bool isFinal = n == 0;
     if ((total & 0x3FFFF) == 0) LOG_DBG("FB2", "parsed %u KB", (unsigned)(total / 1024));
-    if (XML_Parse(p, buf, (int)(n > 0 ? n : 0), isFinal) == XML_STATUS_ERROR) {
+    if (XML_Parse(p, buf.get(), (int)(n > 0 ? n : 0), isFinal) == XML_STATUS_ERROR) {
       if (tolerateAbort && XML_GetErrorCode(p) == XML_ERROR_ABORTED) break;  // early stop requested
       char lineInfo[48];
       snprintf(lineInfo, sizeof(lineInfo), " (line %lu)", (unsigned long)XML_GetCurrentLineNumber(p));
@@ -59,6 +66,40 @@ XML_Parser makeParser() {
   XML_Parser p = XML_ParserCreate(nullptr);
   if (p) XML_SetUnknownEncodingHandler(p, fb2UnknownEncodingHandler, nullptr);
   return p;
+}
+
+// Collect the remaining <binary> registry entries after the expat pass stopped
+// at the first one. Base64 payloads cannot contain '<', so a plain substring
+// scan is safe here; see Fb2Passes.h for the scanner and the rationale.
+void rawScanBinaryTail(const std::string& path, StructurePass& st) {
+  HalFile f;
+  if (!Storage.openFileForRead("FB2", path, f)) {
+    LOG_ERR("FB2", "binary tail scan: cannot reopen file");  // partial registry: affected images skip
+    return;
+  }
+  // Rewind a little before the recorded tag: robust against byte-index
+  // semantics; re-seen tags are deduped by id in recordBinary.
+  const uint64_t start = st.binaryStartByte > 16 ? st.binaryStartByte - 16 : 0;
+  if (!f.seekSet((size_t)start)) {
+    LOG_ERR("FB2", "binary tail scan: seek failed");
+    f.close();
+    return;
+  }
+  const std::unique_ptr<char[]> buf(new (std::nothrow) char[kReadChunk]);
+  if (!buf) {
+    LOG_ERR("FB2", "binary tail scan: out of memory");
+    f.close();
+    return;
+  }
+  RawBinaryScanner scanner;
+  for (;;) {
+    const int n = f.read(buf.get(), kReadChunk);
+    if (n <= 0) break;
+    scanner.feed(buf.get(), (size_t)n, st);
+  }
+  scanner.finish(st);
+  f.close();
+  LOG_DBG("FB2", "binary tail scan: registry now %u entries", (unsigned)st.binaries.size());
 }
 
 }  // namespace
@@ -227,16 +268,38 @@ bool EmitPass::emitFmt(const char* fmt, ...) {
 }
 
 void emitEscaped(EmitPass& e, const char* s, int len) {
+  // Batch the escaping: per-character emitRaw() calls used to dominate the
+  // emission pass. Escaped output goes through a small stack buffer, flushed
+  // straight into the zip (chapter opened once up front).
+  if (!e.ensureChapterOpen()) return;
+  char buf[512];
+  size_t n = 0;
   for (int i = 0; i < len; i++) {
     const char c = s[i];
-    if (c == '&') e.emitRaw("&amp;");
-    else if (c == '<') e.emitRaw("&lt;");
-    else if (c == '>') e.emitRaw("&gt;");
-    else {
-      char one[2] = {c, 0};
-      e.emitRaw(one);
+    const char* rep = nullptr;
+    size_t repLen = 1;
+    if (c == '&') {
+      rep = "&amp;";
+      repLen = 5;
+    } else if (c == '<') {
+      rep = "&lt;";
+      repLen = 4;
+    } else if (c == '>') {
+      rep = "&gt;";
+      repLen = 4;
+    }
+    if (n + repLen > sizeof(buf)) {
+      e.zip.write(buf, n);
+      n = 0;
+    }
+    if (rep) {
+      memcpy(buf + n, rep, repLen);
+      n += repLen;
+    } else {
+      buf[n++] = c;
     }
   }
+  if (n > 0) e.zip.write(buf, n);
 }
 
 void emitStartMarkup(EmitPass& e, const char* tag, const char* id, const char* style) {
@@ -599,7 +662,9 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
   }
   if (meta.language.empty()) meta.language = "ru";
 
-  // Pass 2: structure.
+  // Pass 2: structure. The expat parse stops at the first <binary> (see
+  // structStart); the rest of the image registry comes from a raw scan of
+  // the file tail, which skips parsing megabytes of base64 entirely.
   StructurePass st;
   {
     XML_Parser p = makeParser();
@@ -607,16 +672,19 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
       error = "parser alloc failed";
       return false;
     }
+    st.parser = p;
     XML_SetElementHandler(p, structStart, structEnd);
     XML_SetUserData(p, &st);
-    const bool ok = parseFile(fb2Path, p, error);
+    const bool ok = parseFile(fb2Path, p, error, /*tolerateAbort=*/true);
     XML_ParserFree(p);
+    st.parser = nullptr;
     if (!ok) return false;
   }
   if (strcmp(st.rootName, "FictionBook") != 0) {
     error = "not a FictionBook document";
     return false;
   }
+  if (st.binaryScanRequested) rawScanBinaryTail(fb2Path, st);
   LOG_DBG("FB2", "pass2 structure (%lu ms): chapters=%d binaries=%u ids=%u", millis() - t0,
           st.chapterCursor + 1, (unsigned)st.binaries.size(), (unsigned)st.idTargets.size());
 
