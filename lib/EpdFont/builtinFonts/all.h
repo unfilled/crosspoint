@@ -1,5 +1,8 @@
 #pragma once
 
+// The fork's extra families (Literata, Bitter, Inglobal) ship as SD-card
+// .cpfont families instead of built-ins — sources under builtinFonts/source/,
+// packaging via scripts/sd-fonts.yaml / build-sd-fonts.py.
 #include <builtinFonts/notosans_12_bold.h>
 #include <builtinFonts/notosans_12_bolditalic.h>
 #include <builtinFonts/notosans_12_italic.h>

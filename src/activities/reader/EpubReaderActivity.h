@@ -165,6 +165,16 @@ class EpubReaderActivity final : public ReaderActivity {
   void rememberCurrentContentOffset();
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   void jumpToPercent(int percent);
+  // "Go to page": exact within the current chapter, byte-estimated across the
+  // book (page numbers are render-dependent in reflowable formats).
+  void goToPage(int page);
+  // Reposition to a spine's page fraction; consumed by the pendingPercentJump
+  // path (page = fraction * section pageCount after its build completes).
+  void jumpToSpinePage(int spineIndex, float pageFraction);
+  // SETTINGS.footnotePopup: show a cross-file link target (footnote) in a
+  // popup instead of navigating. Returns true when the popup was opened;
+  // false means the caller should navigate as usual.
+  bool tryFootnotePopup(const std::string& hrefStr);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
   int currentTocIndex() const;
   // Live section position, or the values cached before a child screen

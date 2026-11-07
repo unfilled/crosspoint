@@ -113,6 +113,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Persisted IDs stay stable even though the built-in menu now starts at zero.
   static constexpr uint8_t STORED_NOTOSANS = 1;
   static constexpr uint8_t LEGACY_OPENDYSLEXIC = 2;
+  // 3 was the fork's built-in Literata (since moved to an SD-card family):
+  // settings.json files carrying it fall back to Noto Sans.
+  static constexpr uint8_t LEGACY_LITERATA = 3;
   static constexpr uint8_t BUILTIN_FONT_COUNT = FONT_FAMILY_COUNT;
   // Reader font size is a point size, not an enum slot — see fontPointSize.
   // Legacy 1.4-and-earlier files stored a 0..3 SMALL/MEDIUM/LARGE/EXTRA_LARGE
@@ -312,6 +315,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // E-ink refresh frequency (default 15 pages)
   uint8_t refreshFrequency = REFRESH_15;
   uint8_t hyphenationEnabled = 0;
+  // Show dictionary definitions in a popup over the page instead of the
+  // full-screen definition activity. Default off = stock behavior.
+  uint8_t dictionaryPopup = 0;
+  // Show footnote/link targets in a popup over the page instead of jumping;
+  // targets too large for a popup still fall back to the jump. Default off.
+  uint8_t footnotePopup = 0;
 
   // Reader screen margin settings
   static constexpr uint8_t SCREEN_MARGIN_MIN = 5;

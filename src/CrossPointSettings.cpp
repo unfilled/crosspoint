@@ -276,6 +276,11 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
       case LEGACY_OPENDYSLEXIC:
         copyToField(sdFontFamilyName, "OpenDyslexic", sizeof(sdFontFamilyName));
         break;
+      case LEGACY_LITERATA:
+        // The fork's former built-in Literata now ships as an SD family;
+        // keep the reader on it when the .cpfont package is installed.
+        copyToField(sdFontFamilyName, "Literata", sizeof(sdFontFamilyName));
+        break;
     }
   }
   if (storedFontFamily != STORED_NOTOSANS) needsResave = true;

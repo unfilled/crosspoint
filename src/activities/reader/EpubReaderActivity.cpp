@@ -1,8 +1,12 @@
 #include "EpubReaderActivity.h"
 
+#include "activities/util/KeyboardEntryActivity.h"
+#include "activities/util/TextPopupActivity.h"
+
 #include <BlePageTurner.h>
 #include <Epub/Page.h>
 #include <Epub/blocks/TextBlock.h>
+#include <Fb2.h>
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -30,7 +34,9 @@
 #include "ClippingStore.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "DictionaryPopupActivity.h"
 #include "DictionaryWordSelectActivity.h"
+#include "FootnoteTextExtractor.h"
 #include "EpubReaderBookmarksActivity.h"
 #include "EpubReaderChapterSelectionActivity.h"
 #include "EpubReaderClippingListActivity.h"
@@ -238,7 +244,21 @@ EpubReaderActivity::~EpubReaderActivity() {
 }
 
 bool EpubReaderActivity::loadBook() {
-  auto loadedEpub = makeUniqueNoThrow<Epub>(bookPath, "/.crosspoint");
+  // FB2 books are converted once into a synthetic EPUB in the cache and then
+  // read through the normal pipeline; bookPath stays the original .fb2 for
+  // recents, progress identity, and plugin events.
+  std::string contentPath = bookPath;
+  if (FsHelpers::hasFb2Extension(bookPath)) {
+    GUI.drawPopup(renderer, tr(STR_CONVERTING_FB2));
+    std::string fb2Error;
+    const std::string synthetic = Fb2::ensureEpub(bookPath, "/.crosspoint", &fb2Error);
+    if (synthetic.empty()) {
+      LOG_ERR("ERS", "FB2 conversion failed: %s", fb2Error.c_str());
+      return false;
+    }
+    contentPath = synthetic;
+  }
+  auto loadedEpub = makeUniqueNoThrow<Epub>(contentPath, "/.crosspoint");
   if (!loadedEpub) {
     LOG_ERR("ERS", "Failed to allocate EPUB object");
     return false;
@@ -542,6 +562,20 @@ void EpubReaderActivity::startClipSelection(const int initialX, const int initia
       }
       int top, right, bottom, left;
       renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+      if (SETTINGS.dictionaryPopup) {
+        auto popupActivity = makeUniqueNoThrow<DictionaryPopupActivity>(renderer, mappedInput, std::move(page),
+                                                                       left + SETTINGS.screenMargin,
+                                                                       top + SETTINGS.screenMargin, clipping.text);
+        if (!popupActivity) {
+          LOG_ERR("CLIP", "OOM: dictionary popup activity");
+          requestUpdate();
+          return;
+        }
+        startActivityForResult(std::move(popupActivity), [this](const ActivityResult& result) {
+          if (!result.isCancelled) openDictionaryWordSelect();
+        });
+        return;
+      }
       auto lookup = makeUniqueNoThrow<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page),
                                                                     left + SETTINGS.screenMargin,
                                                                     top + SETTINGS.screenMargin, clipping.text);
@@ -1055,19 +1089,162 @@ void EpubReaderActivity::jumpToPercent(int percent) {
 
   const size_t cumulative = epub->getCumulativeSpineItemSize(targetSpineIndex);
   const size_t spineSize = (cumulative > prevCumulative) ? (cumulative - prevCumulative) : 0;
-  pendingSpineProgress =
+  const float progress =
       (spineSize == 0) ? 0.0f : static_cast<float>(targetSize - prevCumulative) / static_cast<float>(spineSize);
-  pendingSpineProgress = std::clamp(pendingSpineProgress, 0.0f, 1.0f);
+  jumpToSpinePage(targetSpineIndex, progress);
+}
+
+void EpubReaderActivity::jumpToSpinePage(const int spineIndex, const float pageFraction) {
+  if (!epub) return;
+  if (spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) return;
 
   {
     RenderLock lock;
     clearDeferredReposition();
-    currentSpineIndex = targetSpineIndex;
+    currentSpineIndex = spineIndex;
     nextPageNumber = 0;
+    pendingSpineProgress = std::clamp(pageFraction, 0.0f, 1.0f);
     pendingPercentJump = true;
     section.reset();
   }
   requestUpdate();
+}
+
+bool EpubReaderActivity::tryFootnotePopup(const std::string& hrefStr) {
+  const int targetSpineIndex = epub->resolveHrefToSpineIndex(hrefStr);
+  if (targetSpineIndex < 0 || targetSpineIndex == currentSpineIndex) return false;
+
+  // Oversized targets (a chapter, a shared notes file) keep the jump path:
+  // building them for a popup would freeze the screen without progress UI.
+  size_t itemSize = 0;
+  constexpr size_t kMaxPopupSourceBytes = 24 * 1024;
+  if (epub->getItemSize(epub->getSpineItem(targetSpineIndex).href, &itemSize) &&
+      itemSize > kMaxPopupSourceBytes) {
+    return false;
+  }
+
+  std::string anchor;
+  const auto hashPos = hrefStr.find('#');
+  if (hashPos != std::string::npos && hashPos + 1 < hrefStr.size()) {
+    anchor = hrefStr.substr(hashPos + 1);
+  }
+
+  // Read the note's source XHTML straight from the book instead of the
+  // laid-out page cache: page text carries the BOOK's hyphenation cuts and
+  // covers one page of the section only (long notes arrived truncated, page
+  // counts underreported). The source gives whole words and the full note.
+  footnotes::StringSink sink;
+  if (!epub->readItemContentsToStream(epub->getSpineItem(targetSpineIndex).href, sink, 8192)) {
+    LOG_ERR("ERS", "Footnote popup source read failed: %s", hrefStr.c_str());
+    return false;
+  }
+  std::string noteText = footnotes::extractNoteText(sink.out, anchor);
+  // Chapter-sized content is not a popup footnote; 12 KB of plain text maps to
+  // well over a dozen popup pages.
+  if (noteText.size() < 2 || noteText.size() > 12 * 1024) return false;
+
+  int top = 0, right = 0, bottom = 0, left = 0;
+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+
+  // Title: the footnote's marker number when the page knows it, else the
+  // generic label.
+  std::string title = tr(STR_FOOTNOTES);
+  for (const auto& footnote : currentPageFootnotes) {
+    if (hrefStr == footnote.href) {
+      if (footnote.number[0] != '\0') title = footnote.number;
+      break;
+    }
+  }
+
+  auto background = section ? section->loadPage(section->currentPage) : nullptr;
+  auto popupActivity = makeUniqueNoThrow<TextPopupActivity>(renderer, mappedInput, std::move(background),
+                                                            left + SETTINGS.screenMargin,
+                                                            top + SETTINGS.screenMargin, std::move(title),
+                                                            std::move(noteText), "FootnotePopup");
+  if (!popupActivity) {
+    LOG_ERR("ERS", "OOM: footnote popup");
+    return false;
+  }
+  startActivityForResult(std::move(popupActivity), [this](const ActivityResult&) { requestUpdate(); });
+  return true;
+}
+
+void EpubReaderActivity::goToPage(const int page) {
+  if (!epub || page <= 0) return;
+
+  // Exact jump when the number names a page of the loaded chapter.
+  if (section && page <= static_cast<int>(section->pageCount)) {
+    {
+      RenderLock lock;
+      clearDeferredReposition();
+      section->currentPage = page - 1;
+      nextPageNumber = 0;
+    }
+    requestUpdate();
+    return;
+  }
+
+  // Across the book: page numbers are render-dependent, so map the requested
+  // page onto spine+fraction through per-chapter page counts (real from section
+  // caches, byte-proportional estimate elsewhere).
+  const int spineCount = epub->getSpineItemsCount();
+  if (spineCount == 0) return;
+
+  // Pages-per-byte anchor from the loaded chapter when it has layout data.
+  float pagesPerByte = 0.0f;
+  if (section && section->pageCount > 0) {
+    const size_t cumulative = epub->getCumulativeSpineItemSize(currentSpineIndex);
+    const size_t prev = (currentSpineIndex > 0) ? epub->getCumulativeSpineItemSize(currentSpineIndex - 1) : 0;
+    const size_t spineBytes = (cumulative > prev) ? cumulative - prev : 0;
+    if (spineBytes > 0) {
+      pagesPerByte = static_cast<float>(section->estimatedTotalPages()) / static_cast<float>(spineBytes);
+    }
+  }
+  if (pagesPerByte <= 0.0f) pagesPerByte = 1.0f / 3500.0f;  // typical chapter-page density
+
+  int targetSpine = -1;
+  int targetPage = 0;  // 0-based within the target spine
+  int targetCount = 0;  // page count the walk attributed to the target spine
+  int pagesBefore = 0;
+  bool pastEnd = true;
+  for (int i = 0; i < spineCount; i++) {
+    int count = 0;
+    if (i == currentSpineIndex && section && section->pageCount > 0) {
+      count = section->estimatedTotalPages();
+    } else {
+      Section probe(epub, i, renderer);
+      if (const auto cached = probe.getCachedPageCount()) {
+        count = *cached;
+      }
+    }
+    if (count <= 0) {
+      const size_t cumulative = epub->getCumulativeSpineItemSize(i);
+      const size_t prev = (i > 0) ? epub->getCumulativeSpineItemSize(i - 1) : 0;
+      const size_t spineBytes = (cumulative > prev) ? cumulative - prev : 0;
+      count = std::max(1, static_cast<int>(static_cast<float>(spineBytes) * pagesPerByte + 0.5f));
+    }
+    if (page <= pagesBefore + count) {
+      targetSpine = i;
+      targetPage = page - pagesBefore - 1;
+      targetCount = count;
+      pastEnd = false;
+      break;
+    }
+    pagesBefore += count;
+  }
+
+  if (pastEnd) {
+    // Past the estimated end: last page of the final chapter.
+    jumpToSpinePage(spineCount - 1, 1.0f);
+    return;
+  }
+
+  // Fraction lands on targetPage via the pendingPercentJump mapping
+  // (page = fraction * realPageCount); the +0.5 keeps ints exact when the
+  // target spine's cached count matches its built count.
+  const float fraction =
+      targetPage == 0 ? 0.0f : (static_cast<float>(targetPage) + 0.5f) / static_cast<float>(targetCount);
+  jumpToSpinePage(targetSpine, fraction);
 }
 
 void EpubReaderActivity::applyProgressChange(const ProgressChangeResult& sync) {
@@ -1219,6 +1396,40 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               jumpToPercent(std::get<PercentResult>(result.data).percent);
             }
           });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::GO_TO_PAGE: {
+      // Url layout = QwertyEn, so the digit row is on the first screen (the
+      // default layout follows the UI language and would need a switch).
+      const std::string initial = section ? std::to_string(section->currentPage + 1) : "1";
+      auto keyboard = makeUniqueNoThrow<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_GO_TO_PAGE), initial, 6,
+                                                               InputType::Url);
+      if (!keyboard) {
+        LOG_ERR("ERA", "OOM: go-to-page keyboard");
+        break;
+      }
+      startActivityForResult(std::move(keyboard), [this](const ActivityResult& result) {
+        if (result.isCancelled) {
+          openReaderMenu();
+          return;
+        }
+        const std::string& text = std::get<KeyboardResult>(result.data).text;
+        // Digits only; anything else cancels the jump.
+        long parsed = 0;
+        bool valid = !text.empty() && text.size() <= 6;
+        for (const char c : text) {
+          if (c < '0' || c > '9') {
+            valid = false;
+            break;
+          }
+          parsed = parsed * 10 + (c - '0');
+        }
+        if (valid && parsed > 0 && parsed <= 1000000) {
+          goToPage(static_cast<int>(parsed));
+        } else {
+          requestUpdate();
+        }
+      });
       break;
     }
     case EpubReaderMenuActivity::MenuAction::DICTIONARY: {
@@ -3173,8 +3384,8 @@ void EpubReaderActivity::activateMoreRow(int row) {
   }
   // Leaf actions open their own screen / perform the action; close the overlay first.
   overlay = Overlay::None;
-  if (action == MA::GO_TO_PERCENT && overlayPageStored) {
-    // The percent dialog is a popup over the current frame: wipe the toolbar
+  if ((action == MA::GO_TO_PERCENT || action == MA::GO_TO_PAGE) && overlayPageStored) {
+    // The percent/page dialogs are popups over the current frame: wipe the toolbar
     // chrome back to the clean page first so the dialog draws over the page,
     // not the sheet. No refresh push — the dialog's first frame carries it.
     RenderLock lock;
@@ -3202,6 +3413,13 @@ void EpubReaderActivity::activateMoreRow(int row) {
 
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {
   if (!epub) return;
+
+  // Footnote popup: cross-file targets small enough for a frame are shown in
+  // place; the reading position never moves (Back simply closes the popup).
+  // Same-file anchors and oversized targets fall through to the real jump.
+  if (SETTINGS.footnotePopup && !hrefStr.empty() && hrefStr[0] != '#' && tryFootnotePopup(hrefStr)) {
+    return;
+  }
 
   std::string anchor;
   const auto hashPos = hrefStr.find('#');
