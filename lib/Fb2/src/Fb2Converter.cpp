@@ -23,7 +23,8 @@ using namespace fb2passes;  // parsing passes (Fb2Passes.h); emission stays here
 constexpr size_t kReadChunk = 32768;
 constexpr size_t kMaxNavTitleLen = 96;
 
-bool parseFile(const std::string& path, XML_Parser p, std::string& error, const bool tolerateAbort = false) {
+bool parseFile(const std::string& path, XML_Parser p, std::string& error, const bool tolerateAbort = false,
+               void (*onBytes)(void* ctx, uint64_t consumed) = nullptr, void* onBytesCtx = nullptr) {
   HalFile f;
   if (!Storage.openFileForRead("FB2", path, f)) {
     error = "cannot open file";
@@ -56,6 +57,7 @@ bool parseFile(const std::string& path, XML_Parser p, std::string& error, const 
       break;
     }
     total += (size_t)(n > 0 ? n : 0);
+    if (onBytes) onBytes(onBytesCtx, total);
     if (isFinal) break;
   }
   f.close();
@@ -71,7 +73,8 @@ XML_Parser makeParser() {
 // Collect the remaining <binary> registry entries after the expat pass stopped
 // at the first one. Base64 payloads cannot contain '<', so a plain substring
 // scan is safe here; see Fb2Passes.h for the scanner and the rationale.
-void rawScanBinaryTail(const std::string& path, StructurePass& st) {
+void rawScanBinaryTail(const std::string& path, StructurePass& st,
+                       void (*onBytes)(void* ctx, uint64_t consumed) = nullptr, void* onBytesCtx = nullptr) {
   HalFile f;
   if (!Storage.openFileForRead("FB2", path, f)) {
     LOG_ERR("FB2", "binary tail scan: cannot reopen file");  // partial registry: affected images skip
@@ -92,15 +95,49 @@ void rawScanBinaryTail(const std::string& path, StructurePass& st) {
     return;
   }
   RawBinaryScanner scanner;
+  uint64_t pos = start;
   for (;;) {
     const int n = f.read(buf.get(), kReadChunk);
     if (n <= 0) break;
+    pos += (size_t)n;
     scanner.feed(buf.get(), (size_t)n, st);
+    if (onBytes) onBytes(onBytesCtx, pos);
   }
   scanner.finish(st);
   f.close();
   LOG_DBG("FB2", "binary tail scan: registry now %u entries", (unsigned)st.binaries.size());
 }
+
+// Maps per-pass byte consumption onto monotonic 0..100 percentages. Expat is
+// fed whole 32 KB chunks, so a pass can report slightly past its phase range;
+// percentages therefore only ever move forward.
+struct ConvertProgress {
+  void (*fn)(void* ctx, uint8_t pct) = nullptr;
+  void* ctx = nullptr;
+  uint64_t fileSize = 0;
+  uint8_t base = 0;
+  uint8_t span = 0;
+  uint8_t last = 0;
+
+  static void onBytes(void* self, const uint64_t consumed) {
+    auto* p = static_cast<ConvertProgress*>(self);
+    if (!p->fn || p->fileSize == 0) return;
+    const uint64_t scaled = consumed * p->span / p->fileSize;
+    const uint8_t pct = p->base + static_cast<uint8_t>(scaled > p->span ? p->span : scaled);
+    if (pct > p->last) {
+      p->last = pct;
+      p->fn(p->ctx, pct);
+    }
+  }
+  void phase(const uint8_t b, const uint8_t s) { base = b; span = s; }
+  // Phases that stop early (metadata, structure) snap to their range end.
+  void finish(const uint8_t end) {
+    if (fn && end > last) {
+      last = end;
+      fn(ctx, end);
+    }
+  }
+};
 
 }  // namespace
 
@@ -109,7 +146,8 @@ const char* Fb2Converter::imageExtensionForContentType(const char* contentType) 
   return fb2passes::imageExtensionForContentType(contentType);
 }
 
-bool Fb2Converter::readMetadata(const std::string& fb2Path, Metadata& meta, std::string& error) {
+bool Fb2Converter::readMetadata(const std::string& fb2Path, Metadata& meta, std::string& error,
+                                void (*onBytes)(void* ctx, uint64_t consumed), void* onBytesCtx) {
   XML_Parser p = makeParser();
   if (!p) {
     error = "parser alloc failed";
@@ -120,7 +158,7 @@ bool Fb2Converter::readMetadata(const std::string& fb2Path, Metadata& meta, std:
   XML_SetElementHandler(p, metaStart, metaEnd);
   XML_SetCharacterDataHandler(p, metaText);
   XML_SetUserData(p, &m);
-  const bool ok = parseFile(fb2Path, p, error, true);
+  const bool ok = parseFile(fb2Path, p, error, true, onBytes, onBytesCtx);
   XML_ParserFree(p);
   if (!ok) return false;
   meta = m.collect();
@@ -695,13 +733,28 @@ bool writeXmlEscaped(StoredZipWriter& zip, const char* s) {
 
 }  // namespace
 
-bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPath, std::string& error) {
+bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPath, std::string& error,
+                           void (*progress)(void* ctx, uint8_t pct), void* progressCtx) {
   error.clear();
   const uint32_t t0 = millis();
 
+  // Progress phases: metadata 0-10, structure 10-40, emission 40-100.
+  ConvertProgress prog;
+  prog.fn = progress;
+  prog.ctx = progressCtx;
+  if (progress) {
+    HalFile sf;
+    if (Storage.openFileForRead("FB2", fb2Path, sf)) {
+      prog.fileSize = sf.size();
+      sf.close();
+    }
+  }
+
   // Pass 1: metadata (a missing title-info is tolerated; XML errors are not).
   Metadata meta;
-  const bool haveMeta = readMetadata(fb2Path, meta, error);
+  prog.phase(0, 10);
+  const bool haveMeta = readMetadata(fb2Path, meta, error, &ConvertProgress::onBytes, &prog);
+  prog.finish(10);
   if (!error.empty()) return false;
   LOG_DBG("FB2", "pass1 metadata (%lu ms): %s, lang=%s, cover=%s, series=%s", millis() - t0,
           meta.title.c_str(), meta.language.c_str(), meta.coverRef.c_str(), meta.seriesName.c_str());
@@ -720,6 +773,7 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
   // structStart); the rest of the image registry comes from a raw scan of
   // the file tail, which skips parsing megabytes of base64 entirely.
   StructurePass st;
+  prog.phase(10, 30);
   {
     XML_Parser p = makeParser();
     if (!p) {
@@ -729,7 +783,7 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
     st.parser = p;
     XML_SetElementHandler(p, structStart, structEnd);
     XML_SetUserData(p, &st);
-    const bool ok = parseFile(fb2Path, p, error, /*tolerateAbort=*/true);
+    const bool ok = parseFile(fb2Path, p, error, /*tolerateAbort=*/true, &ConvertProgress::onBytes, &prog);
     XML_ParserFree(p);
     st.parser = nullptr;
     if (!ok) return false;
@@ -738,7 +792,8 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
     error = "not a FictionBook document";
     return false;
   }
-  if (st.binaryScanRequested) rawScanBinaryTail(fb2Path, st);
+  if (st.binaryScanRequested) rawScanBinaryTail(fb2Path, st, &ConvertProgress::onBytes, &prog);
+  prog.finish(40);
   LOG_DBG("FB2", "pass2 structure (%lu ms): chapters=%d binaries=%u ids=%u", millis() - t0,
           st.chapterCursor + 1, (unsigned)st.binaries.size(), (unsigned)st.idTargets.size());
 
@@ -751,6 +806,7 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
     return false;
   }
   bool parsed = false;
+  prog.phase(40, 60);
   {
     XML_Parser p = makeParser();
     if (!p) {
@@ -762,7 +818,7 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
     XML_SetCharacterDataHandler(p, emitText);
     XML_SetUserData(p, &e);
     LOG_DBG("FB2", "pass3 emission start");
-    parsed = parseFile(fb2Path, p, error);
+    parsed = parseFile(fb2Path, p, error, false, &ConvertProgress::onBytes, &prog);
     XML_ParserFree(p);
   }
   e.closeChapter();
@@ -946,6 +1002,7 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
     return false;
   }
 
+  prog.finish(100);
   LOG_INF("FB2", "converted in %lu ms: %u chapters, %u images (%d broken), %u anchors", millis() - t0,
           (unsigned)e.materialized.size(), (unsigned)st.binaries.size(), e.brokenImages,
           (unsigned)st.idTargets.size());

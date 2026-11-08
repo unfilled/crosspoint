@@ -217,6 +217,15 @@ void moveFinishedBookToReadFolder(const std::string& srcPath, const std::string&
 // boards a press stops the build once the loop has debounced it.
 bool buttonContactClosed() { return gpio.rawInputActive(); }
 
+// Set before every background build tick; read by bgBuildTickYield().
+uint32_t bgBuildTickDeadlineMs = 0;
+
+// Yield predicate for the background build tick: a button press, or the tick's
+// time budget expiring. Wrap-safe through the signed subtraction.
+bool bgBuildTickYield() {
+  return buttonContactClosed() || static_cast<int32_t>(millis() - bgBuildTickDeadlineMs) >= 0;
+}
+
 }  // namespace
 
 EpubReaderActivity::~EpubReaderActivity() {
@@ -249,9 +258,25 @@ bool EpubReaderActivity::loadBook() {
   // recents, progress identity, and plugin events.
   std::string contentPath = bookPath;
   if (FsHelpers::hasFb2Extension(bookPath)) {
-    GUI.drawPopup(renderer, tr(STR_CONVERTING_FB2));
+    const Rect popupRect = GUI.drawPopup(renderer, tr(STR_CONVERTING_FB2));
     std::string fb2Error;
-    const std::string synthetic = Fb2::ensureEpub(bookPath, "/.crosspoint", &fb2Error);
+    // Progress bar in the conversion popup. Each repaint is an e-ink refresh,
+    // so repaints are limited to >=2% steps or one per 400 ms (and completion).
+    struct ConversionProgressUi {
+      GfxRenderer* renderer;
+      Rect rect;
+      uint8_t lastPct;
+      uint32_t lastMs;
+    } progressUi{&renderer, popupRect, 0, 0};
+    const auto onProgress = [](void* ctx, const uint8_t pct) {
+      auto* ui = static_cast<ConversionProgressUi*>(ctx);
+      const uint32_t now = millis();
+      if (pct != 100 && pct - ui->lastPct < 2 && now - ui->lastMs < 400) return;
+      ui->lastPct = pct;
+      ui->lastMs = now;
+      GUI.fillPopupProgress(*ui->renderer, ui->rect, pct);
+    };
+    const std::string synthetic = Fb2::ensureEpub(bookPath, "/.crosspoint", &fb2Error, onProgress, &progressUi);
     if (synthetic.empty()) {
       LOG_ERR("ERS", "FB2 conversion failed: %s", fb2Error.c_str());
       return false;
@@ -450,6 +475,45 @@ void EpubReaderActivity::updateBuildProgressBar(const bool force) {
   GUI.fillPopupProgress(renderer, buildPopupRect, pct);
 }
 
+// Thin progress strip along the top edge, driven by backgroundBuildTick: fills
+// as the background section build advances, erased when the build ends. The
+// top margin is always free of chrome (status bar sits at the bottom), and
+// repaints only move forward so a lagging page-count estimate cannot make the
+// strip jump backwards within a section.
+void EpubReaderActivity::updateBuildStrip() {
+  if (!renderer.hasFrameBuffer()) return;
+  const int corner = BoardConfig::ACTIVE.cornerRadius;
+  int marginTop, marginRight, marginBottom, marginLeft;
+  renderer.getOrientedViewableTRBL(&marginTop, &marginRight, &marginBottom, &marginLeft);
+  const int x0 = std::max(marginLeft, corner) + 2;
+  const int x1 = renderer.getScreenWidth() - std::max(marginRight, corner) - 2;
+  constexpr int stripY = 0;
+  constexpr int stripH = 4;
+  if (x1 - x0 < 24) return;  // nowhere sane to draw
+
+  if (!section || !section->isBuilding()) {
+    if (buildStripPct < 0) return;
+    buildStripPct = -1;
+    renderer.fillRect(x0, stripY, x1 - x0, stripH, false);
+    renderer.displayBuffer();
+    return;
+  }
+
+  const int pages = section->pageCount;
+  const int denom = std::max<int>(section->estimatedTotalPages(), pages);
+  if (denom < BUILD_STRIP_MIN_PAGES) return;
+  const int rawPct = denom > 0 ? pages * 100 / denom : 0;
+  const int pct = std::max(rawPct, std::max(buildStripPct, 0));
+  if (buildStripPct >= 0 && pct < buildStripPct + BUILD_STRIP_STEP_PERCENT) return;
+  buildStripPct = pct;
+
+  const int fillW = (x1 - x0 - 2) * pct / 100;
+  renderer.fillRect(x0, stripY, x1 - x0, stripH, false);  // clear the track
+  renderer.drawRect(x0, stripY, x1 - x0, stripH, true);
+  if (fillW > 0) renderer.fillRect(x0 + 1, stripY + 1, fillW, stripH - 2, true);
+  renderer.displayBuffer();
+}
+
 // Debounced state of every button. Covers the frame between a raw release and its debounced
 // release edge, which would otherwise run a build step before the page turn.
 bool EpubReaderActivity::anyButtonPressed() const {
@@ -470,8 +534,11 @@ void EpubReaderActivity::backgroundBuildTick() {
   // A build step can lend the framebuffer (image probes), which hands it back white while the
   // panel still shows the page; redraw so nothing is later painted over the blank buffer.
   const uint32_t loansBefore = renderer.frameBufferLoanCount();
-  const bool built = section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK, &buttonContactClosed);
-  if (renderer.frameBufferLoanCount() != loansBefore) {
+  bgBuildTickDeadlineMs = millis() + BACKGROUND_BUILD_TICK_BUDGET_MS;
+  const bool built = section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK, &bgBuildTickYield);
+  const bool loaned = renderer.frameBufferLoanCount() != loansBefore;
+  if (loaned) {
+    buildStripPct = -1;  // framebuffer came back white; the strip repaints with the page
     pageBufferStale = true;
     requestUpdate();
   }
@@ -479,9 +546,14 @@ void EpubReaderActivity::backgroundBuildTick() {
     LOG_ERR("ERS", "Background section build failed");
     backgroundBuildFailedSpine = currentSpineIndex;
     nextPageNumber = section->currentPage;
+    buildStripPct = -1;  // the error screen repaints everything
     section.reset();
     requestUpdate();
-  } else if (section->isBuildComplete() && applyDeferredReposition()) {
+    return;
+  }
+  // Never after a loan: pushing the white buffer would flash the panel.
+  if (!loaned) updateBuildStrip();
+  if (section->isBuildComplete() && applyDeferredReposition()) {
     requestUpdate();
   }
 }
@@ -2122,6 +2194,7 @@ void EpubReaderActivity::renderBook() {
   applyDeferredReposition();
 
   renderer.clearScreen();
+  buildStripPct = -1;  // the fresh page wiped the strip; the next background tick repaints it
 
   if (section->pageCount == 0) {
     LOG_DBG("ERS", "No pages to render");

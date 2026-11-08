@@ -5,6 +5,7 @@
 // The synthetic filename embeds the source size+mtime, so a changed book
 // converts to a new file and the Epub-side cache keys change with it.
 
+#include <cstdint>
 #include <string>
 
 class Fb2 {
@@ -13,7 +14,10 @@ class Fb2 {
   static std::string cacheDirFor(const std::string& fb2Path, const std::string& cacheRoot);
 
   // Path of the synthetic EPUB for the current source fingerprint, or "" when
-  // the book cannot be converted (*error carries the reason).
+  // the book cannot be converted (*error carries the reason). The optional
+  // progress callback fires only when a conversion actually runs (never on a
+  // cache hit) and receives monotonic 0..100 percentages.
   static std::string ensureEpub(const std::string& fb2Path, const std::string& cacheRoot,
-                                std::string* error = nullptr);
+                                std::string* error = nullptr,
+                                void (*progress)(void* ctx, uint8_t pct) = nullptr, void* progressCtx = nullptr);
 };
