@@ -421,9 +421,33 @@ bool EpubReaderActivity::buildTickHeapGate() {
 
 void EpubReaderActivity::showBuildPopup(GfxRenderer& renderer, int& pagesUntilFullRefresh) {
   if (!buildPopupPending || !renderer.hasFrameBuffer()) return;
-  GUI.drawPopup(renderer, tr(STR_INDEXING));
+  buildPopupRect = GUI.drawPopup(renderer, tr(STR_INDEXING));
   pagesUntilFullRefresh = 1;
   buildPopupPending = false;
+  buildPopupShown = true;
+  buildPopupLoanCount = renderer.frameBufferLoanCount();
+  buildProgressNextMark = BUILD_PROGRESS_PAGE_STEP;
+  updateBuildProgressBar(true);  // paint the initial bar with the current estimate
+}
+
+// Progress bar inside the indexing popup: repaints each time the blocking build
+// crosses another BUILD_PROGRESS_PAGE_STEP pages. Callers invoke it after every
+// incremental build chunk; the 50-page gate keeps e-ink refreshes rare.
+void EpubReaderActivity::updateBuildProgressBar(const bool force) {
+  if (!buildPopupShown || !section || !renderer.hasFrameBuffer()) return;
+  const int pages = section->pageCount;
+  if (!force && pages < buildProgressNextMark) return;
+  buildProgressNextMark = (pages / BUILD_PROGRESS_PAGE_STEP + 1) * BUILD_PROGRESS_PAGE_STEP;
+  if (renderer.frameBufferLoanCount() != buildPopupLoanCount) {
+    // A build step lent the framebuffer and returned it white: repaint the
+    // whole popup, not just the bar, or the text/frame would stay erased.
+    buildPopupRect = GUI.drawPopup(renderer, tr(STR_INDEXING));
+    buildPopupLoanCount = renderer.frameBufferLoanCount();
+  }
+  const uint16_t est = section->estimatedTotalPages();
+  const int denom = std::max<int>(est, pages);  // estimate can lag the built count early on
+  const int pct = denom > 0 ? pages * 100 / denom : 0;
+  GUI.fillPopupProgress(renderer, buildPopupRect, pct);
 }
 
 // Debounced state of every button. Covers the frame between a raw release and its debounced
@@ -1935,8 +1959,14 @@ void EpubReaderActivity::renderBook() {
                                              target > BUILD_POPUP_PAGE_THRESHOLD);
           }
           if (showPopup) {
-            GUI.drawPopup(renderer, tr(STR_INDEXING));
+            buildPopupRect = GUI.drawPopup(renderer, tr(STR_INDEXING));
             pagesUntilFullRefresh = 1;
+            buildPopupShown = true;
+            buildPopupLoanCount = renderer.frameBufferLoanCount();
+            buildProgressNextMark = BUILD_PROGRESS_PAGE_STEP;
+            updateBuildProgressBar(true);
+          } else {
+            buildPopupShown = false;  // any older popup is gone from the panel
           }
           buildPopupPending = !showPopup;
           // Section (re)builds are the heap-hungriest path (per-word
@@ -1985,6 +2015,7 @@ void EpubReaderActivity::renderBook() {
               showBuildError();
               return;
             }
+            updateBuildProgressBar();
           }
           buildPopupPending = false;
         }
@@ -2037,8 +2068,14 @@ void EpubReaderActivity::renderBook() {
     return;
   }
   if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
-    GUI.drawPopup(renderer, tr(STR_INDEXING));
+    buildPopupRect = GUI.drawPopup(renderer, tr(STR_INDEXING));
     pagesUntilFullRefresh = 1;
+    buildPopupShown = true;
+    buildPopupLoanCount = renderer.frameBufferLoanCount();
+    buildProgressNextMark = BUILD_PROGRESS_PAGE_STEP;
+    updateBuildProgressBar(true);
+  } else {
+    buildPopupShown = false;  // any older popup is gone from the panel
   }
   while (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
     if (!section->isBuilding() && !section->startBuild(renderSpec)) {
@@ -2054,9 +2091,18 @@ void EpubReaderActivity::renderBook() {
         showBuildError();
         return;
       }
+      updateBuildProgressBar();
     }
   }
-  if (section->isBuilding()) {
+  if (section->isBuilding() && section->currentPage >= static_cast<int>(section->pageCount)) {
+    // Page turn into unbuilt territory: the build outran nothing on screen yet,
+    // so put the popup up before the wait loop, then report progress into it.
+    buildPopupRect = GUI.drawPopup(renderer, tr(STR_INDEXING));
+    pagesUntilFullRefresh = 1;
+    buildPopupShown = true;
+    buildPopupLoanCount = renderer.frameBufferLoanCount();
+    buildProgressNextMark = BUILD_PROGRESS_PAGE_STEP;
+    updateBuildProgressBar(true);
     while (!section->isBuildComplete() && section->currentPage >= static_cast<int>(section->pageCount)) {
       if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
         LOG_ERR("ERS", "Failed during incremental section build");
@@ -2064,6 +2110,7 @@ void EpubReaderActivity::renderBook() {
         showBuildError();
         return;
       }
+      updateBuildProgressBar();
     }
   }
 

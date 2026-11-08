@@ -55,6 +55,25 @@ inline const char* findAttr(const char** attrs, const char* name) {
   return nullptr;
 }
 
+// Largest prefix length that ends on a complete UTF-8 codepoint: byte-count
+// truncation must never split a multi-byte sequence, or the XML consumer gets
+// invalid bytes in the middle of nav.xhtml / content.opf.
+inline size_t utf8SafeLen(const char* s, size_t maxLen) {
+  size_t end = 0;
+  size_t i = 0;
+  while (i < maxLen) {
+    const uint8_t c = static_cast<uint8_t>(s[i]);
+    size_t cpLen = 1;
+    if ((c & 0xE0) == 0xC0) cpLen = 2;
+    else if ((c & 0xF0) == 0xE0) cpLen = 3;
+    else if ((c & 0xF8) == 0xF0) cpLen = 4;
+    if (i + cpLen > maxLen) break;
+    i += cpLen;
+    end = i;
+  }
+  return end;
+}
+
 struct TextCapture {
   char buf[kMaxTitleLen + 1] = {};
   size_t len = 0;
@@ -67,7 +86,11 @@ struct TextCapture {
   }
   void stop(bool keep) {
     active = false;
-    if (keep && !taken && len > 0) taken = true;
+    if (keep && !taken && len > 0) {
+      len = utf8SafeLen(buf, len);  // the cap may have cut a codepoint
+      buf[len] = 0;
+      taken = true;
+    }
   }
   void feed(const char* s, int n) {
     if (!active || taken) return;
@@ -285,7 +308,10 @@ inline void structureElement(StructurePass& s, const char* ln, const char** attr
   if (strcmp(ln, "section") == 0) {
     if (start) {
       s.sectionNesting++;
-      if (s.depth == s.bodyDepth + 1) s.chapterCursor++;
+      // Mirror the emission pass exactly: chapters beyond the cap are dropped
+      // there, so ids from overflow sections must not resolve to phantom
+      // chapter numbers — they fold into the last materialized chapter.
+      if (s.depth == s.bodyDepth + 1 && s.chapterCursor < kMaxChapters) s.chapterCursor++;
     } else {
       s.sectionNesting--;
     }
@@ -355,6 +381,27 @@ inline bool rawTagAttr(const char* tag, size_t len, const char* name, std::strin
     return true;
   }
   return false;
+}
+
+// Dialog typography: a paragraph leading with "— " (em-dash + regular space)
+// must not let justification stretch the gap after the dash. The emission
+// pass rewrites that first space to "&#160;" (NBSP); the reader's layout
+// already keeps NBSP gaps un-stretched and unbreakable.
+// Returns 1 when the prefix is dash+space, 0 when definitively not, and -1
+// while more bytes could still change the answer (split multi-byte dash).
+inline int detectDialogDashPrefix(const char* s, size_t len) {
+  static constexpr char kDash[3] = {(char)0xE2, (char)0x80, (char)0x94};  // U+2014
+  size_t i = 0;
+  while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) i++;
+  for (size_t k = 0; k < 4; k++, i++) {
+    if (i >= len) return -1;
+    if (k < 3) {
+      if (s[i] != kDash[k]) return 0;
+    } else {
+      return s[i] == ' ' ? 1 : 0;
+    }
+  }
+  return 0;  // unreachable; keeps the compiler quiet
 }
 
 constexpr size_t kNpos = static_cast<size_t>(-1);

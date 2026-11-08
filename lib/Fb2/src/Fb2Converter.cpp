@@ -177,6 +177,12 @@ struct EmitPass {
   int binaryIdx = -1;
   size_t binaryBytes = 0;
   Base64Decoder b64;
+  int brokenImages = 0;  // decode failures / size-cap hits, logged at the end
+
+  // Dialog-dash rewrite: after a <p> opens, the first bytes are held until
+  // detectDialogDashPrefix() can decide (see emitText).
+  bool paraStartPending = false;
+  std::string paraStartBuf;
 
   EmitPass(const Fb2Converter::Metadata& m, const StructurePass& s, const char* id)
       : meta(m), structure(s), bookId(id) {}
@@ -215,7 +221,10 @@ struct EmitPass {
     zip.finishEntry();
     chapterOpenIdx = -1;
     if (!materialized.empty()) {
-      memcpy(materialized.back().title, navBuf, sizeof(materialized.back().title));
+      // navBuf may have hit the cap mid-codepoint; never emit split UTF-8.
+      const size_t safeLen = utf8SafeLen(navBuf, strlen(navBuf));
+      memcpy(materialized.back().title, navBuf, safeLen);
+      materialized.back().title[safeLen] = 0;
     }
   }
 
@@ -393,6 +402,10 @@ void XMLCALL emitStart(void* userData, const XML_Char* name, const char** attrs)
     } else {
       emitStartMarkup(e, "p", id, nullptr);
       e.pushFrame("</p>", true);
+      // Possible dialog line: hold the first bytes until the dash check can
+      // decide (see emitText). Only plain paragraphs — not headings/verse.
+      e.paraStartPending = true;
+      e.paraStartBuf.clear();
     }
     return;
   }
@@ -474,7 +487,9 @@ void XMLCALL emitStart(void* userData, const XML_Char* name, const char** attrs)
     return;
   }
   if (strcmp(ln, "v") == 0) {
-    emitStartMarkup(e, "p", id, "text-indent:0;margin:0");
+    // Verse lines stay left-aligned: the global justify setting must not
+    // stretch short poetry lines across the page.
+    emitStartMarkup(e, "p", id, "text-align:left;text-indent:0;margin:0");
     e.pushFrame("</p>", true);
     return;
   }
@@ -553,12 +568,18 @@ void XMLCALL emitEnd(void* userData, const XML_Char* name) {
   const char* ln = localName(name);
 
   if (e.binaryIdx >= 0 && strcmp(ln, "binary") == 0) {
-    e.b64.finish([&e](const uint8_t* data, size_t len) {
+    const bool decoded = e.b64.finish([&e](const uint8_t* data, size_t len) {
       e.binaryBytes += len;
       if (e.binaryBytes > kMaxImageBytes) return false;
       return e.zip.write(data, len);
     });
     e.zip.finishEntry();
+    if (!decoded) {
+      // Entry stays in the zip with valid CRC of the partial data: the book
+      // remains readable, but the image is truncated/garbage -- log loudly.
+      e.brokenImages++;
+      LOG_ERR("FB2", "binary #%d: base64 decode failed or size cap hit", e.binaryIdx);
+    }
     e.binaryIdx = -1;
   } else if (strcmp(ln, "title") == 0) {
     e.inTitle = false;
@@ -573,6 +594,16 @@ void XMLCALL emitEnd(void* userData, const XML_Char* name) {
     // start (or the body end) does. Keeping the entry open lets stray
     // body-level content between sections append to the current chapter
     // instead of re-opening the same entry name twice in the ZIP.
+  }
+
+  if (e.paraStartPending) {
+    // Element ended before the dash check could decide: emit the held bytes
+    // unchanged (too short or not a dialog start after all).
+    e.paraStartPending = false;
+    if (!e.paraStartBuf.empty() && e.skipDepth < 0 && e.textCarrier > 0) {
+      emitEscaped(e, e.paraStartBuf.data(), (int)e.paraStartBuf.size());
+    }
+    e.paraStartBuf.clear();
   }
 
   if (!e.frames.empty()) {
@@ -600,6 +631,29 @@ void XMLCALL emitText(void* userData, const XML_Char* s, int len) {
     return;
   }
   if (e.skipDepth >= 0 || e.textCarrier <= 0) return;  // drop inter-block whitespace
+
+  if (e.paraStartPending) {
+    e.paraStartBuf.append(s, len);
+    int verdict = detectDialogDashPrefix(e.paraStartBuf.data(), e.paraStartBuf.size());
+    if (verdict < 0 && e.paraStartBuf.size() > 64) verdict = 0;  // all-whitespace start: stop holding
+    if (verdict < 0) return;                                     // need more bytes to decide
+    e.paraStartPending = false;
+    std::string held = std::move(e.paraStartBuf);
+    e.paraStartBuf.clear();
+    if (verdict == 1) {
+      // Dialog line: emit the leading whitespace and the dash, then glue the
+      // following word to it with NBSP so justify cannot stretch the gap.
+      size_t i = 0;
+      while (held[i] == ' ' || held[i] == '\t' || held[i] == '\r' || held[i] == '\n') i++;
+      emitEscaped(e, held.data(), (int)(i + 3));
+      e.emitRaw("&#160;");
+      if (held.size() > i + 4) emitEscaped(e, held.data() + i + 4, (int)(held.size() - i - 4));
+    } else {
+      emitEscaped(e, held.data(), (int)held.size());
+    }
+    return;
+  }
+
   emitEscaped(e, s, len);
   if (e.navCapture) e.writeNavTitleChunk(s, len);
 }
@@ -892,8 +946,8 @@ bool Fb2Converter::convert(const std::string& fb2Path, const std::string& outPat
     return false;
   }
 
-  LOG_INF("FB2", "converted in %lu ms: %u chapters, %u images, %u anchors", millis() - t0,
-          (unsigned)e.materialized.size(), (unsigned)st.binaries.size(),
+  LOG_INF("FB2", "converted in %lu ms: %u chapters, %u images (%d broken), %u anchors", millis() - t0,
+          (unsigned)e.materialized.size(), (unsigned)st.binaries.size(), e.brokenImages,
           (unsigned)st.idTargets.size());
   return true;
 }

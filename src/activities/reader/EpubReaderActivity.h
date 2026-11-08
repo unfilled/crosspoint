@@ -19,6 +19,7 @@
 #include "ReaderActivity.h"
 #include "ReaderToolbarUi.h"
 #include "components/OptionPopup.h"
+#include "components/themes/BaseTheme.h"
 
 class EpubReaderActivity final : public ReaderActivity {
   std::shared_ptr<Epub> epub;
@@ -159,7 +160,19 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
   static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
   bool buildPopupPending = false;
+  // Progress bar state for the blocking section-build loops: the popup rect is
+  // captured when the indexing popup is drawn, and the bar repaints each time
+  // the build crosses another 50-page mark.
+  Rect buildPopupRect{};
+  bool buildPopupShown = false;
+  int buildProgressNextMark = 50;
+  // frameBufferLoanCount at the last popup (re)paint: a build step can lend the
+  // framebuffer (image probes) and hand it back white, which forces a full
+  // popup repaint instead of a bar-only touch-up.
+  uint32_t buildPopupLoanCount = 0;
+  static constexpr int BUILD_PROGRESS_PAGE_STEP = 50;
   void showBuildPopup(GfxRenderer& renderer, int& pagesUntilFullRefresh);
+  void updateBuildProgressBar(bool force = false);
   bool applyDeferredReposition();
   void clearDeferredReposition();
   void rememberCurrentContentOffset();
