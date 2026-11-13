@@ -2,6 +2,7 @@
 
 #include <Bitmap.h>
 #include <Epub.h>
+#include <Fb2.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
@@ -97,13 +98,27 @@ void HomeActivity::fillCoverGridFromLibrary() {
   }
 }
 
+namespace {
+// FB2 books are read through the synthetic EPUB in the fb2 cache; the source
+// file is XML, not a ZIP, so cover tooling must resolve the conversion first.
+// Cache hit for any book the reader has opened (recents always qualify).
+std::string coverContentPath(const std::string& bookPath) {
+  if (!FsHelpers::hasFb2Extension(bookPath)) return bookPath;
+  const std::string synthetic = Fb2::ensureEpub(bookPath, "/.crosspoint");
+  if (synthetic.empty()) LOG_ERR("HOME", "FB2 conversion failed for cover: %s", bookPath.c_str());
+  return synthetic;
+}
+}  // namespace
+
 void HomeActivity::resolveGridCoverPaths() {
   for (auto& book : recentBooks) {
     if (!book.coverBmpPath.empty()) continue;
     // Constructors only derive cache paths; no metadata parsing or image generation.
     // Keep these large objects off the task stack and release each before the next book.
     if (FsHelpers::hasReflowableBookExtension(book.path)) {
-      auto epub = makeUniqueNoThrow<Epub>(book.path, "/.crosspoint");
+      const std::string contentPath = coverContentPath(book.path);
+      if (contentPath.empty()) continue;
+      auto epub = makeUniqueNoThrow<Epub>(contentPath, "/.crosspoint");
       if (!epub) {
         LOG_ERR("HOME", "OOM: EPUB thumbnail path");
         continue;
@@ -125,7 +140,12 @@ void HomeActivity::loadGridCover(RecentBook& book, int height, bool& showingLoad
     return;
   // Only one parser lives at a time; EPUB/XTC objects exceed the stack budget.
   if (FsHelpers::hasReflowableBookExtension(book.path)) {
-    auto epub = makeUniqueNoThrow<Epub>(book.path, "/.crosspoint");
+    const std::string contentPath = coverContentPath(book.path);
+    if (contentPath.empty()) {
+      book.coverBmpPath.clear();
+      return;
+    }
+    auto epub = makeUniqueNoThrow<Epub>(contentPath, "/.crosspoint");
     if (!epub) {
       LOG_ERR("HOME", "OOM: cover EPUB");
       return;
@@ -181,23 +201,29 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
       if (!Storage.exists(coverPath.c_str())) {
         // If epub/txt/md, try to load the metadata for title/author and cover
         if (FsHelpers::hasReflowableBookExtension(book.path)) {
-          Epub epub(book.path, "/.crosspoint");
-          // Skip loading css since we only need metadata here
-          epub.load(false, true);
-
-          // Try to generate thumbnail image for Continue Reading card
-          if (!showingLoading) {
-            showingLoading = true;
-            popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-          }
-          GUI.fillPopupProgress(renderer, popupRect, 10 + progress * (90 / recentBooks.size()));
-          bool success = epub.generateThumbBmp(thumbHeight);
-          if (!success) {
+          const std::string contentPath = coverContentPath(book.path);
+          if (contentPath.empty()) {
             RECENT_BOOKS.updateBook(book.path, book.title, book.author, "");
             book.coverBmpPath = "";
+          } else {
+            Epub epub(contentPath, "/.crosspoint");
+            // Skip loading css since we only need metadata here
+            epub.load(false, true);
+
+            // Try to generate thumbnail image for Continue Reading card
+            if (!showingLoading) {
+              showingLoading = true;
+              popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+            }
+            GUI.fillPopupProgress(renderer, popupRect, 10 + progress * (90 / recentBooks.size()));
+            bool success = epub.generateThumbBmp(thumbHeight);
+            if (!success) {
+              RECENT_BOOKS.updateBook(book.path, book.title, book.author, "");
+              book.coverBmpPath = "";
+            }
+            coverRendered = false;
+            requestUpdate();
           }
-          coverRendered = false;
-          requestUpdate();
         } else if (FsHelpers::hasXtcExtension(book.path)) {
           // Handle XTC file
           Xtc xtc(book.path, "/.crosspoint");

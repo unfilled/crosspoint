@@ -14,7 +14,8 @@ std::string Fb2::cacheDirFor(const std::string& fb2Path, const std::string& cach
   return cacheRoot + "/fb2_" + std::to_string(std::hash<std::string>{}(fb2Path));
 }
 
-std::string Fb2::ensureEpub(const std::string& fb2Path, const std::string& cacheRoot, std::string* error) {
+std::string Fb2::ensureEpub(const std::string& fb2Path, const std::string& cacheRoot, std::string* error,
+                            void (*progress)(void* ctx, uint8_t pct), void* progressCtx) {
   if (error) error->clear();
 
   HalFile f;
@@ -59,7 +60,7 @@ std::string Fb2::ensureEpub(const std::string& fb2Path, const std::string& cache
 
   const uint32_t t0 = millis();
   std::string convertError;
-  if (!Fb2Converter::convert(fb2Path, tmp, convertError)) {
+  if (!Fb2Converter::convert(fb2Path, tmp, convertError, progress, progressCtx)) {
     Storage.remove(tmp.c_str());
     if (error) *error = convertError.empty() ? "conversion failed" : convertError;
     LOG_ERR("FB2", "convert failed for %s: %s", fb2Path.c_str(), convertError.c_str());

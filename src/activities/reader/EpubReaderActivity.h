@@ -19,6 +19,7 @@
 #include "ReaderActivity.h"
 #include "ReaderToolbarUi.h"
 #include "components/OptionPopup.h"
+#include "components/themes/BaseTheme.h"
 
 class EpubReaderActivity final : public ReaderActivity {
   std::shared_ptr<Epub> epub;
@@ -130,6 +131,10 @@ class EpubReaderActivity final : public ReaderActivity {
 
   static constexpr int BUILD_PAGES_PER_CHUNK = 8;
   static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;
+  // One background build tick yields at latest when this budget expires, so
+  // input latency stays bounded even on expensive pages (image probes, slow
+  // storage). Checked once per parser step.
+  static constexpr uint32_t BACKGROUND_BUILD_TICK_BUDGET_MS = 100;
   static constexpr size_t BACKGROUND_BUILD_MIN_FREE_HEAP = 32 * 1024;
   static constexpr size_t BACKGROUND_BUILD_MIN_MAX_ALLOC = 16 * 1024;
   // Requires the render lock; heap admission is checked separately by the build tick.
@@ -159,7 +164,28 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
   static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
   bool buildPopupPending = false;
+  // Progress bar state for the blocking section-build loops: the popup rect is
+  // captured when the indexing popup is drawn, and the bar repaints each time
+  // the build crosses another 50-page mark.
+  Rect buildPopupRect{};
+  bool buildPopupShown = false;
+  int buildProgressNextMark = 50;
+  // frameBufferLoanCount at the last popup (re)paint: a build step can lend the
+  // framebuffer (image probes) and hand it back white, which forces a full
+  // popup repaint instead of a bar-only touch-up.
+  uint32_t buildPopupLoanCount = 0;
+  static constexpr int BUILD_PROGRESS_PAGE_STEP = 50;
   void showBuildPopup(GfxRenderer& renderer, int& pagesUntilFullRefresh);
+  void updateBuildProgressBar(bool force = false);
+  // Passive build indicator: a thin strip along the top edge that fills while a
+  // background section build runs. Painted only in BUILD_STRIP_STEP_PERCENT
+  // steps (each repaint is an e-ink refresh) and only for sections big enough
+  // for the wait to be noticeable. buildStripPct is the last painted whole
+  // percent, -1 when the strip is not on screen.
+  static constexpr int BUILD_STRIP_STEP_PERCENT = 5;
+  static constexpr int BUILD_STRIP_MIN_PAGES = 40;
+  int buildStripPct = -1;
+  void updateBuildStrip();
   bool applyDeferredReposition();
   void clearDeferredReposition();
   void rememberCurrentContentOffset();

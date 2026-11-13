@@ -3,9 +3,14 @@ add_executable(Fb2ConverterTest
   Fb2EncodingTest.cpp
   Fb2MetadataTest.cpp
   Fb2StructureTest.cpp
+  Fb2TextUtilsTest.cpp
+  StoredZipWriterTest.cpp
+  ${REPO_ROOT}/lib/Fb2/src/StoredZipWriter.cpp
+  ${REPO_ROOT}/lib/miniz/src/miniz_impl.c
 )
 
 target_include_directories(Fb2ConverterTest PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/stubs
   ${REPO_ROOT}/lib/Fb2/src
   ${REPO_ROOT}/lib/expat
 )

@@ -1,6 +1,7 @@
 #include "BookProgress.h"
 
 #include <Epub.h>
+#include <Fb2.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
@@ -18,8 +19,11 @@ uint32_t readLe32(const uint8_t* p) {
 int loadBookProgress(const std::string& path) {
   uint8_t data[10]{};
   if (FsHelpers::hasReflowableBookExtension(path)) {
+    // FB2: progress lives in the synthetic EPUB's cache, not beside the source.
+    const std::string contentPath = FsHelpers::hasFb2Extension(path) ? Fb2::ensureEpub(path, "/.crosspoint") : path;
+    if (contentPath.empty()) return -1;
     // Metadata objects exceed the stack budget; only the featured book is loaded, once per entry.
-    auto epub = makeUniqueNoThrow<Epub>(path, "/.crosspoint");
+    auto epub = makeUniqueNoThrow<Epub>(contentPath, "/.crosspoint");
     if (!epub) {
       LOG_ERR("HOME", "OOM: progress metadata");
       return -1;

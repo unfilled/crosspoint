@@ -28,11 +28,17 @@ class Fb2Converter {
 
   // Convert the FB2 at fb2Path into an EPUB container at outPath.
   // On failure returns false and fills `error` with a short reason.
-  static bool convert(const std::string& fb2Path, const std::string& outPath, std::string& error);
+  // The optional progress callback receives monotonic 0..100 percentages
+  // (byte-based per pass; called from the converting thread).
+  static bool convert(const std::string& fb2Path, const std::string& outPath, std::string& error,
+                      void (*progress)(void* ctx, uint8_t pct) = nullptr, void* progressCtx = nullptr);
 
   // Read only description/title-info (fast; stops parsing at </description>).
-  // Used by the library index for title/author rows.
-  static bool readMetadata(const std::string& fb2Path, Metadata& meta, std::string& error);
+  // Used by the library index for title/author rows. The optional byte hook
+  // reports source bytes consumed; convert() uses it for progress.
+  static bool readMetadata(const std::string& fb2Path, Metadata& meta, std::string& error,
+                           void (*onBytes)(void* ctx, uint64_t consumed) = nullptr,
+                           void* onBytesCtx = nullptr);
 
   // content-type -> ".jpg"/".png"/".gif"; "" when the firmware cannot render it
   static const char* imageExtensionForContentType(const char* contentType);
