@@ -1,146 +1,117 @@
-// Repro for: drop-cap paragraphs lay out hyphenation of the lines BELOW the
-// letter as if the letter still indented them — hyphens land where the narrow
-// (beside-the-letter) width would break, not the full width.
+// Repro for: drop-cap paragraphs laid out the lines BELOW the letter as if
+// the letter still indented them — hyphens landed where the narrow
+// (beside-the-letter) width would break, not at the full width.
+// ChapterHtmlSlimParser drives ParsedText exactly this way for a drop-cap
+// paragraph (narrow width with maxLines=letter-lines, then the rest at full
+// width — see ChapterHtmlSlimParser::layoutDropCapLines), so the two-step
+// call is reproduced here directly.
 //
-// Method: the stub renderer is monospaced (8px/char + 4px space), so line
-// breaks are fully deterministic. The same long-word paragraph is laid out
-// twice — with and without a 4-line drop cap — and every line after the
-// spanned ones must be IDENTICAL between the two runs (same words, same
-// hyphen splits). Any difference means the post-cap lines inherited the
-// narrow width.
+// Root cause: computeHyphenatedLineBreaks used to compute breaks for the
+// WHOLE paragraph, and hyphenateWordAtIndex materializes every split in the
+// word list (baked '-' + inserted remainder word) — including lines beyond
+// maxLines that layoutAndExtractLines never consumed. Those narrow-width
+// pieces survived into the full-width second call.
+//
+// Method: the stub renderer is monospaced (8px/char + 4px space) and the
+// opt-in hyphenation hook (ParserLinkStubs.cpp) splits any first-on-line
+// word every 5 bytes. Words are 40 chars (320px) — wider than any test
+// line, so the narrow phase ends mid-word and any leaked narrow split shows
+// up as a wrong piece or hyphen flag in the tail.
 
 #include <Epub/Page.h>
+#include <Epub/ParsedText.h>
 #include <GfxRenderer.h>
 #include <gtest/gtest.h>
 
-#include <algorithm>
-#include <optional>
+#include <cstdint>
 #include <string>
 #include <vector>
 
-// Same suite convention as ChapterHtmlSlimParserTest.cpp: expose the parser's
-// private SAX entry points for this translation unit only.
-#define class struct
-#define private public
-#include "ChapterHtmlSlimParser.h"
-#undef private
-#undef class
+// Opt-in hyphenation hook owned by ParserLinkStubs.cpp.
+extern bool gTestHyphenationFallbackEnabled;
 
 namespace {
 
-struct DropCapHyphenRepro : ::testing::Test {
-  GfxRenderer renderer;
-  CssParser cssParser{"/tmp"};
-  std::vector<std::unique_ptr<Page>> pages;
-  std::optional<ChapterHtmlSlimParser> parser;
+const GfxRenderer& gRenderer() {
+  static GfxRenderer renderer;
+  return renderer;
+}
 
-  void makeParser(const bool hyphenation) {
-    parser.emplace(nullptr, "unused.xhtml", renderer, 0, 1.0f, false, 0,
-                   static_cast<uint16_t>(renderer.getScreenWidth()),
-                   static_cast<uint16_t>(renderer.getScreenHeight()), hyphenation, false,
-                   [this](std::unique_ptr<Page> page, uint16_t, uint16_t, uint32_t) {
-                     pages.push_back(std::move(page));
-                   },
-                   true, "", "", 0, std::vector<std::string>{}, nullptr, &cssParser);
-    parser->beginParse();
-  }
-
-  static void open(ChapterHtmlSlimParser& p, const char* tag, const char* style) {
-    const XML_Char* attributes[] = {"style", style, nullptr};
-    ChapterHtmlSlimParser::startElement(&p, tag, style ? attributes : nullptr);
-  }
-  static void text(ChapterHtmlSlimParser& p, const std::string& value) {
-    ChapterHtmlSlimParser::characterData(&p, value.c_str(), static_cast<int>(value.size()));
-  }
-  static void close(ChapterHtmlSlimParser& p, const char* tag) { ChapterHtmlSlimParser::endElement(&p, tag); }
-
-  // Long Russian words so the ru hyphenation trie actually splits them at
-  // deterministic points in the monospaced stub metrics.
-  static std::string paragraph() {
-    std::string s;
-    for (int i = 0; i < 14; i++) {
-      s += "представительство окончательности ";
-    }
-    return s;
-  }
-
-  struct LineWords {
-    int xPos = 0;
-    std::vector<std::string> words;
-    std::vector<bool> hyphen;  // word carries a discretionary hyphen
-  };
-
-  static std::vector<LineWords> collect(const std::vector<std::unique_ptr<Page>>& pages) {
-    std::vector<LineWords> out;
-    for (const auto& page : pages) {
-      for (const auto& el : page->elements) {
-        if (el->getTag() != TAG_PageLine) continue;
-        const auto* line = static_cast<const PageLine*>(el.get());
-        const TextBlock& b = *line->getBlock();
-        LineWords lw;
-        lw.xPos = line->xPos;
-        for (uint16_t i = 0; i < b.wordCount(); i++) {
-          lw.words.push_back(b.wordText(i));
-          lw.hyphen.push_back(b.wordHasDiscretionaryHyphen(i));
-        }
-        out.push_back(std::move(lw));
-      }
-    }
-    return out;
-  }
+struct LineWords {
+  std::vector<std::string> words;
+  std::vector<bool> hyphen;
 };
 
-TEST_F(DropCapHyphenRepro, LinesBelowTheLetterMatchFullWidthLayout) {
-  // Reference run: same paragraph, no drop cap, hyphenation on.
-  makeParser(true);
-  open(*parser, "p", nullptr);
-  text(*parser, paragraph());
-  close(*parser, "p");
-  const auto reference = collect(pages);
+template <typename Emit>
+void runLayout(ParsedText& text, const int width, const size_t maxLines, Emit&& emit) {
+  text.layoutAndExtractLines(
+      gRenderer(), 0, static_cast<uint16_t>(width),
+      [&](std::unique_ptr<TextBlock> line, uint32_t) {
+        LineWords lw;
+        for (uint16_t i = 0; i < line->wordCount(); i++) {
+          lw.words.push_back(line->wordText(i));
+          lw.hyphen.push_back(line->wordHasDiscretionaryHyphen(i));
+        }
+        emit(std::move(lw));
+      },
+      true, 0, 100, maxLines, nullptr);
+}
 
-  // Drop-cap run: initial-letter:4 spans four lines.
-  pages.clear();
-  makeParser(true);
-  open(*parser, "p", nullptr);
-  open(*parser, "span", "float: left; initial-letter: 4");
-  text(*parser, "О");
-  close(*parser, "span");
-  text(*parser, "тContextHolder " + paragraph());
-  close(*parser, "p");
-  const auto withCap = collect(pages);
+struct HyphenationScope {
+  HyphenationScope() { gTestHyphenationFallbackEnabled = true; }
+  ~HyphenationScope() { gTestHyphenationFallbackEnabled = false; }
+};
 
-  ASSERT_FALSE(reference.empty());
-  ASSERT_GT(withCap.size(), 5u) << "expected beside-lines plus full-width tail";
+constexpr size_t kWordChars = 40;  // 320px: wider than any test line
 
-  // First four lines sit beside the letter (indented); from line 5 on the
-  // layout must match the no-cap reference EXACTLY — same words, same
-  // hyphenation points. Offset by one word: the cap run starts with the
-  // paragraph text after the span, so compare the cap run's tail against the
-  // reference tail (drop the first word of the first reference line only if
-  // the cap run's text differs by a leading word).
-  const size_t spanned = 4;
-  ASSERT_GT(withCap.size(), spanned) << "paragraph did not fill the letter's lines";
-  for (size_t i = 0; i < spanned; i++) EXPECT_GT(withCap[i].xPos, 0) << "line " << i << " should be indented";
-  EXPECT_EQ(withCap[spanned].xPos, 0) << "first line below the letter should be at the margin";
+void addWord(ParsedText& text, const char c) { text.addWord(std::string(kWordChars, c), EpdFontFamily::REGULAR); }
 
-  // Compare tails: everything from the first at-margin line must equal the
-  // reference run's corresponding lines. Align by first word content.
-  size_t refStart = 0;
-  const std::string firstTailWord = withCap[spanned].words.empty() ? "" : withCap[spanned].words[0];
-  for (size_t r = 0; r < reference.size(); r++) {
-    if (!reference[r].words.empty() && reference[r].words[0] == firstTailWord) {
-      refStart = r;
-      break;
-    }
-  }
-  const size_t tailLen = std::min(reference.size() - refStart, withCap.size() - spanned);
-  ASSERT_GT(tailLen, 1u);
-  for (size_t i = 0; i < tailLen; i++) {
-    EXPECT_EQ(withCap[spanned + i].words, reference[refStart + i].words)
-        << "tail line " << i << " words differ (narrow-width hyphenation leaked below the letter)";
-    EXPECT_EQ(withCap[spanned + i].hyphen, reference[refStart + i].hyphen)
-        << "tail line " << i << " hyphen marks differ";
+void expectSameLines(const std::vector<LineWords>& actual, const std::vector<LineWords>& expected) {
+  ASSERT_EQ(actual.size(), expected.size());
+  for (size_t i = 0; i < actual.size(); i++) {
+    EXPECT_EQ(actual[i].words, expected[i].words) << "line " << i;
+    EXPECT_EQ(actual[i].hyphen, expected[i].hyphen) << "line " << i;
   }
 }
 
 }  // namespace
+
+// Two-phase drop-cap layout: 2 narrow (150px) lines, then the remainder at
+// full width (200px). The tail must equal a fresh full-width layout of the
+// characters the narrow phase did not consume.
+TEST(DropCapHyphenation, TailAfterNarrowPhaseUsesFullWidth) {
+  HyphenationScope hyphenation;
+
+  std::vector<LineWords> lines;
+  {
+    BlockStyle style;
+    ParsedText text(true, false, style, 0);
+    for (char c = 'a'; c <= 'h'; c++) addWord(text, c);
+    runLayout(text, 150, 2, [&](LineWords lw) { lines.push_back(std::move(lw)); });
+    ASSERT_EQ(lines.size(), 2u) << "maxLines must bound the narrow phase";
+    runLayout(text, 200, SIZE_MAX, [&](LineWords lw) { lines.push_back(std::move(lw)); });
+  }
+
+  // Characters the narrow phase consumed (a baked '-' is not source text).
+  size_t consumed = 0;
+  for (size_t i = 0; i < 2; i++) {
+    ASSERT_EQ(lines[i].words.size(), 1u);
+    ASSERT_TRUE(lines[i].hyphen[0]) << "narrow test lines must end mid-word";
+    consumed += lines[i].words[0].size() - 1;
+  }
+  ASSERT_LT(consumed, kWordChars) << "the narrow/full boundary must stay inside word 0";
+
+  // Reference: the remaining characters laid out at full width in one call —
+  // the partial first word, then the untouched whole words.
+  std::vector<LineWords> reference;
+  {
+    BlockStyle style;
+    ParsedText text(true, false, style, 0);
+    text.addWord(std::string(kWordChars - consumed, 'a'), EpdFontFamily::REGULAR);
+    for (char c = 'b'; c <= 'h'; c++) addWord(text, c);
+    runLayout(text, 200, SIZE_MAX, [&](LineWords lw) { reference.push_back(std::move(lw)); });
+  }
+
+  const std::vector<LineWords> tail(lines.begin() + 2, lines.end());
+  expectSameLines(tail, reference);
+}

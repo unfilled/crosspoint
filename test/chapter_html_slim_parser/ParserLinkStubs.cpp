@@ -15,7 +15,18 @@ const char* lookupHtmlEntity(const char*, size_t) { return nullptr; }
 bool isExplicitHyphen(uint32_t) { return false; }
 bool isSoftHyphen(uint32_t) { return false; }
 
-std::vector<Hyphenator::BreakInfo> Hyphenator::breakOffsets(const std::string&, bool) { return {}; }
+// Opt-in test hook: DropCapHyphenTest enables deterministic fallback breaks
+// (every 5 bytes, inserted hyphen) to exercise the hyphenated layout path.
+// Every other test in the suite keeps the historical no-hyphenation stub.
+bool gTestHyphenationFallbackEnabled = false;
+
+std::vector<Hyphenator::BreakInfo> Hyphenator::breakOffsets(const std::string& word, const bool includeFallback) {
+  std::vector<Hyphenator::BreakInfo> breaks;
+  if (gTestHyphenationFallbackEnabled && includeFallback) {
+    for (size_t offset = 5; offset < word.size(); offset += 5) breaks.push_back({offset, true});
+  }
+  return breaks;
+}
 
 ImageBlock::ImageBlock(const std::string& imagePath, const std::string& srcPath, int16_t width, int16_t height)
     : imagePath(imagePath), srcPath(srcPath), width(width), height(height) {}

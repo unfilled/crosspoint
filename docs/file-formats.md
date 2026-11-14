@@ -90,6 +90,15 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
+### Version 68
+
+Version 68 preserves the binary layout but rebuilds completed and partial
+sections for corrected hyphenation of drop-cap paragraphs: line breaks below
+the letter were computed at the beside-the-letter narrow width because the
+greedy hyphenation pass materialized splits for the whole paragraph instead
+of only the extracted lines. Book metadata and saved progress are kept, but
+pagination of hyphenated books can change slightly.
+
 ### Version 67
 
 Version 67 preserves the binary layout but rebuilds completed and partial

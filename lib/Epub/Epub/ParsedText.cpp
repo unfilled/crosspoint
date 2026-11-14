@@ -963,14 +963,22 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   std::vector<size_t> lineBreakIndices;
   if (hyphenationEnabled) {
     // Use greedy layout that can split words mid-loop when a hyphenated prefix fits.
-    lineBreakIndices =
-        computeHyphenatedLineBreaks(renderer, fontId, pageWidth, wordWidths, wordContinues, wordNoSpaceBefore);
+    lineBreakIndices = computeHyphenatedLineBreaks(renderer, fontId, pageWidth, wordWidths, wordContinues,
+                                                   wordNoSpaceBefore, maxLines);
   } else {
     lineBreakIndices = computeLineBreaks(renderer, fontId, pageWidth, wordWidths, wordContinues, wordNoSpaceBefore);
   }
-  const size_t lineCount = std::min(maxLines, includeLastLine ? lineBreakIndices.size() : lineBreakIndices.size() - 1);
+  // The bounded pass may have stopped before the paragraph's natural end. Every
+  // line it did close was ended by overflow, so it stays valid when the
+  // remainder is laid out later (unlike the natural last line, which could
+  // still absorb streamed-in words — hence the includeLastLine withholding).
+  const bool stoppedEarly =
+      !lineBreakIndices.empty() && lineBreakIndices.back() < wordWidths.size();
+  const size_t lineCount =
+      stoppedEarly ? lineBreakIndices.size()
+                   : std::min(maxLines, includeLastLine ? lineBreakIndices.size() : lineBreakIndices.size() - 1);
 
-  const bool endIsKnown = includeLastLine && lineCount == lineBreakIndices.size();
+  const bool endIsKnown = includeLastLine && !stoppedEarly && lineCount == lineBreakIndices.size();
   for (size_t i = 0; i < lineCount; ++i) {
     if (stopRequested && *stopRequested) return;
     linesAfterCurrent = endIsKnown ? static_cast<int>(lineCount - 1 - i) : -1;
@@ -1341,14 +1349,17 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
 std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& renderer, const int fontId,
                                                             const int pageWidth, std::vector<uint16_t>& wordWidths,
                                                             std::vector<bool>& continuesVec,
-                                                            std::vector<bool>& noSpaceBeforeVec) {
+                                                            std::vector<bool>& noSpaceBeforeVec, const size_t maxBreaks) {
   const int firstLineIndent = resolveFirstLineIndent(true, renderer, fontId);
 
   std::vector<size_t> lineBreakIndices;
   size_t currentIndex = 0;
   bool isFirstLine = !firstLineConsumed;
 
-  while (currentIndex < wordWidths.size()) {
+  // Stop once the caller has all the breaks it will extract: every further
+  // line would still be hyphenated at THIS call's width, mutating words the
+  // next call expects to lay out at its own (drop-cap narrow/full two-phase).
+  while (currentIndex < wordWidths.size() && lineBreakIndices.size() < maxBreaks) {
     const size_t lineStart = currentIndex;
     int lineWidth = 0;
 
