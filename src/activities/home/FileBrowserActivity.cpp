@@ -68,18 +68,29 @@ void formatFileName(const std::string& filename, char* buffer, const size_t buff
     return;
   }
   const bool isDirectory = filename.back() == '/';
-  const size_t dot = isDirectory ? filename.size() - 1 : filename.rfind('.');
-  const int length = static_cast<int>(dot == std::string::npos ? filename.size() : dot);
+  // Directories hide the trailing '/'; files keep the extension in the label
+  // (the trailing value column shows the file size instead).
+  const int length = static_cast<int>(isDirectory ? filename.size() - 1 : filename.size());
   const char* format = isDirectory && !UITheme::getInstance().getTheme().showsFileIcons() ? "[%.*s]" : "%.*s";
   snprintf(buffer, bufferSize, format, length, filename.c_str());
   // Compose only the display copy; filesystem lookup needs the raw entry bytes.
   utf8ComposeNfcInPlace(buffer);
 }
 
-void formatFileExtension(const std::string& filename, char* buffer, const size_t bufferSize) {
-  buffer[0] = '\0';
-  if (filename.empty() || filename.back() == '/') return;
-  if (const char* extension = strrchr(filename.c_str(), '.')) snprintf(buffer, bufferSize, "%s", extension);
+// Human-readable size for the row's trailing value column. Latin units only:
+// no translated strings, and the fixed "%u"/"%u.%u" formats avoid float
+// printf support questions on the embedded newlib.
+void formatFileSize(const uint32_t bytes, char* buffer, const size_t bufferSize) {
+  if (bytes < 1024) {
+    snprintf(buffer, bufferSize, "%u B", static_cast<unsigned>(bytes));
+  } else if (bytes < 1024u * 1024u) {
+    snprintf(buffer, bufferSize, "%u KB", (bytes + 512u) / 1024u);
+  } else if (bytes < 10u * 1024u * 1024u) {
+    const uint32_t tenths = (bytes * 10u + 512u * 1024u) / (1024u * 1024u);
+    snprintf(buffer, bufferSize, "%u.%u MB", tenths / 10u, tenths % 10u);
+  } else {
+    snprintf(buffer, bufferSize, "%u MB", (bytes + 512u * 1024u) / (1024u * 1024u));
+  }
 }
 
 FileBrowserActivity::FileBrowserActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -123,22 +134,31 @@ void FileBrowserActivity::loadFiles() {
     }
 
     if (isDirectory) {
-      files.emplace_back(std::string(fileNameBuffer.get()) + "/");
+      files.push_back({std::string(fileNameBuffer.get()) + "/", 0});
     } else {
       std::string_view filename{fileNameBuffer.get()};
+      // fileSize() reads the already-fetched FAT directory entry: no extra SD I/O.
+      const auto size = static_cast<uint32_t>(file.fileSize());
       if (mode == Mode::PickFirmware) {
         // Firmware picker: only show .bin files.
         if (FsHelpers::checkFileExtension(filename, ".bin")) {
-          files.emplace_back(filename);
+          files.push_back({std::string(filename), size});
         }
       } else if (FsHelpers::hasReflowableBookExtension(filename) || FsHelpers::hasXtcExtension(filename) ||
                  FsHelpers::hasImageExtension(filename)) {
-        files.emplace_back(filename);
+        files.push_back({std::string(filename), size});
       }
     }
   }
   root.close();
-  FsHelpers::sortFileList(files);
+  // Directories first (trailing '/'), then natural order — same policy as
+  // FsHelpers::sortFileList, applied to the name field.
+  std::sort(files.begin(), files.end(), [](const FileEntry& a, const FileEntry& b) {
+    const bool aIsDir = a.name.back() == '/';
+    const bool bIsDir = b.name.back() == '/';
+    if (aIsDir != bIsDir) return aIsDir;
+    return FsHelpers::naturalLess(a.name, b.name);
+  });
 }
 
 // fui::ListProps::rowProvider — formats row `index` from files[index] into the
@@ -152,14 +172,18 @@ void FileBrowserActivity::loadFiles() {
 void FileBrowserActivity::provideRow(void* ctx, const uint16_t index, fui::ListItem& item) {
   auto* self = static_cast<FileBrowserActivity*>(ctx);
   if (index >= self->files.size()) return;
-  const std::string& entry = self->files[index];
-  formatFileName(entry, self->rowNameBuf, sizeof(self->rowNameBuf));
+  const FileEntry& entry = self->files[index];
+  formatFileName(entry.name, self->rowNameBuf, sizeof(self->rowNameBuf));
   item.label = self->rowNameBuf;
-  formatFileExtension(entry, self->rowExtBuf, sizeof(self->rowExtBuf));
-  if (self->rowExtBuf[0] != '\0') {
-    item.value = self->rowExtBuf;
+  // Trailing value column: file size for files, nothing for directories.
+  self->rowValueBuf[0] = '\0';
+  if (entry.name.back() != '/') {
+    formatFileSize(entry.sizeBytes, self->rowValueBuf, sizeof(self->rowValueBuf));
   }
-  item.icon = listIconFor(UITheme::getFileIcon(entry));
+  if (self->rowValueBuf[0] != '\0') {
+    item.value = self->rowValueBuf;
+  }
+  item.icon = listIconFor(UITheme::getFileIcon(entry.name));
   item.actionValue = static_cast<int16_t>(index);
 }
 
@@ -191,7 +215,7 @@ void FileBrowserActivity::prewarmRowGlyphs(const int start) {
       [](const void* ctx, uint32_t i) -> const char* {
         auto* c = const_cast<PrewarmCtx*>(static_cast<const PrewarmCtx*>(ctx));
         if (i < static_cast<uint32_t>(c->count)) {
-          formatFileName(c->self->files[c->first + i], c->self->rowNameBuf, sizeof(c->self->rowNameBuf));
+          formatFileName(c->self->files[c->first + i].name, c->self->rowNameBuf, sizeof(c->self->rowNameBuf));
           return c->self->rowNameBuf;
         }
         return c->self->basepath.c_str();
@@ -249,7 +273,7 @@ void FileBrowserActivity::onExit() {
   // open saves its own snapshot; this covers leaving without opening).
   if (mode == Mode::Books && !basepath.empty()) {
     const std::string entry =
-        (nav.selected >= 0 && nav.selected < static_cast<int>(files.size())) ? files[nav.selected] : "";
+        (nav.selected >= 0 && nav.selected < static_cast<int>(files.size())) ? files[nav.selected].name : "";
     if (APP_STATE.browserLastPath != basepath || APP_STATE.browserLastEntry != entry) {
       APP_STATE.browserLastPath = basepath;
       APP_STATE.browserLastEntry = entry;
@@ -371,7 +395,7 @@ void FileBrowserActivity::activateSelected() {
   // shrank the list; the next render re-registers the rows.
   if (nav.selected < 0 || nav.selected >= listCount()) return;
 
-  const std::string& entry = files[nav.selected];
+  const std::string& entry = files[nav.selected].name;
   bool isDirectory = (entry.back() == '/');
 
   // Firmware picker: select file -> return path; navigate into directories normally.
@@ -416,7 +440,7 @@ void FileBrowserActivity::showEntryActions() {
     return;
   }
 
-  const bool isDirectory = files[nav.selected].back() == '/';
+  const bool isDirectory = files[nav.selected].name.back() == '/';
   static constexpr StrId FILE_OPTIONS[] = {StrId::STR_OPEN, StrId::STR_DELETE, StrId::STR_RENAME};
   static constexpr StrId DIRECTORY_OPTIONS[] = {StrId::STR_OPEN, StrId::STR_DELETE};
   optionPopup.show(StrId::STR_FILENAME, isDirectory ? DIRECTORY_OPTIONS : FILE_OPTIONS, isDirectory ? 2 : 3, 0,
@@ -437,7 +461,7 @@ void FileBrowserActivity::deleteSelected() {
 
   std::string cleanBasePath = basepath;
   if (cleanBasePath.back() != '/') cleanBasePath += "/";
-  const std::string entry = files[nav.selected];
+  const std::string entry = files[nav.selected].name;
   const std::string fullPath = cleanBasePath + entry;
 
   auto handler = [this, fullPath](const ActivityResult& res) {
@@ -478,7 +502,7 @@ void FileBrowserActivity::deleteSelected() {
 void FileBrowserActivity::startRename() {
   if (files.empty() || nav.selected < 0 || nav.selected >= listCount()) return;
 
-  const std::string oldEntry = files[nav.selected];
+  const std::string oldEntry = files[nav.selected].name;
   if (oldEntry.back() == '/') return;
 
   std::string cleanBasePath = basepath;
@@ -684,13 +708,13 @@ void FileBrowserActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   // Tap opens/navigates; long-press shows entry actions (physical buttons stay in loop()).
   props.inputMask = fui::InputTouch | fui::InputLongPress;
-  props.valueInset = 8;  // air between the extension and the row edge
+  props.valueInset = 8;  // air between the size value and the row edge
   // Names use up to two small-font lines; shared list layout sizes each row.
   fui::TextStyle label = screen.theme().smallText;
   label.maxLines = 2;
   props.labelText = label;
 
-  // The trailing value here is just the short extension: skip the balanced
+  // The trailing value here is just the short size string: skip the balanced
   // 60%-band wrap cap and let both name lines run the full width before it.
   props.balanceWrappedLabelWithValue = false;
   syncListViewport(screen, props);
@@ -722,7 +746,7 @@ void FileBrowserActivity::drawFooter() {
   // In PickFirmware mode, Confirm on a .bin returns the path to the caller (not "open"); show
   // STR_SELECT instead. Directories in the same picker still descend, so keep STR_OPEN there.
   const bool selectingFirmwareFile = mode == Mode::PickFirmware && !files.empty() && nav.selected >= 0 &&
-                                     nav.selected < listCount() && files[nav.selected].back() != '/';
+                                     nav.selected < listCount() && files[nav.selected].name.back() != '/';
   const char* confirmLabel = files.empty() ? "" : (selectingFirmwareFile ? tr(STR_SELECT) : tr(STR_OPEN));
   const auto labels = mappedInput.mapLabels(backLabel, confirmLabel, files.empty() ? "" : tr(STR_DIR_UP),
                                             files.empty() ? "" : tr(STR_DIR_DOWN));
@@ -730,6 +754,7 @@ void FileBrowserActivity::drawFooter() {
 }
 
 size_t FileBrowserActivity::findEntry(const std::string& name) const {
-  const auto entry = std::find(files.begin(), files.end(), name);
+  const auto entry =
+      std::find_if(files.begin(), files.end(), [&name](const FileEntry& e) { return e.name == name; });
   return entry != files.end() ? static_cast<size_t>(entry - files.begin()) : 0;
 }

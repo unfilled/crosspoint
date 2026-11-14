@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,9 +24,15 @@ class FileBrowserActivity final : public UiListActivity {
 
   Mode mode = Mode::Books;
 
+  // One directory entry: directories keep a trailing '/' in name and carry no size.
+  struct FileEntry {
+    std::string name;
+    uint32_t sizeBytes = 0;
+  };
+
   // Files state
   std::string basepath = "/";
-  std::vector<std::string> files;
+  std::vector<FileEntry> files;
   std::unique_ptr<char[]> fileNameBuffer;
   OptionPopup optionPopup;
 
@@ -39,7 +46,7 @@ class FileBrowserActivity final : public UiListActivity {
   // contract only needs them valid until the next provideRow() call.
   static constexpr size_t ROW_NAME_BUF_SIZE = 512;  // NAME_BUFFER_SIZE + "[]" + terminator slack
   char rowNameBuf[ROW_NAME_BUF_SIZE]{};
-  char rowExtBuf[16]{};
+  char rowValueBuf[16]{};  // trailing value column: human-readable file size ("3.4 MB")
   static void provideRow(void* ctx, uint16_t index, freeink::ui::ListItem& item);
 
   // CJK fallback glyphs are prewarmed for a bounded window of rows around the
