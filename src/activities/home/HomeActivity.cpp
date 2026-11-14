@@ -102,11 +102,12 @@ namespace {
 // FB2 books are read through the synthetic EPUB in the fb2 cache; the source
 // file is XML, not a ZIP, so cover tooling must resolve the conversion first.
 // Cache hit for any book the reader has opened (recents always qualify).
+// Never converts here: after a cache wipe, converting every recent book on the
+// home screen would freeze it for the whole batch — a missing cover is fine
+// until the book itself is opened.
 std::string coverContentPath(const std::string& bookPath) {
   if (!FsHelpers::hasFb2Extension(bookPath)) return bookPath;
-  const std::string synthetic = Fb2::ensureEpub(bookPath, "/.crosspoint");
-  if (synthetic.empty()) LOG_ERR("HOME", "FB2 conversion failed for cover: %s", bookPath.c_str());
-  return synthetic;
+  return Fb2::cachedEpub(bookPath, "/.crosspoint");
 }
 }  // namespace
 

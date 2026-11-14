@@ -23,6 +23,11 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   uint8_t readerActivityLoadCount = 0;
   bool lastSleepFromReader = false;
   bool showBootScreen = true;
+  // File browser resume point (this fork): the folder the reader last browsed
+  // and the entry it last opened a book from, so the browser reopens where the
+  // user left off instead of at the root.
+  std::string browserLastPath;
+  std::string browserLastEntry;
 
   static const char* getFilePath() { return "/.crosspoint/state.json"; }
   void toJson(JsonDocument& doc) const;

@@ -20,7 +20,9 @@ int loadBookProgress(const std::string& path) {
   uint8_t data[10]{};
   if (FsHelpers::hasReflowableBookExtension(path)) {
     // FB2: progress lives in the synthetic EPUB's cache, not beside the source.
-    const std::string contentPath = FsHelpers::hasFb2Extension(path) ? Fb2::ensureEpub(path, "/.crosspoint") : path;
+    // Cache-only lookup — this runs per home entry and must not block on a
+    // conversion (HomeActivity::coverContentPath follows the same rule).
+    const std::string contentPath = FsHelpers::hasFb2Extension(path) ? Fb2::cachedEpub(path, "/.crosspoint") : path;
     if (contentPath.empty()) return -1;
     // Metadata objects exceed the stack budget; only the featured book is loaded, once per entry.
     auto epub = makeUniqueNoThrow<Epub>(contentPath, "/.crosspoint");

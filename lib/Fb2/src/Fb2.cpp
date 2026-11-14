@@ -14,6 +14,19 @@ std::string Fb2::cacheDirFor(const std::string& fb2Path, const std::string& cach
   return cacheRoot + "/fb2_" + std::to_string(std::hash<std::string>{}(fb2Path));
 }
 
+std::string Fb2::cachedEpub(const std::string& fb2Path, const std::string& cacheRoot) {
+  HalFile f;
+  if (!Storage.openFileForRead("FB2", fb2Path, f)) return "";
+  const size_t srcSize = f.size();
+  const uint32_t mtime = f.modificationTime();
+  f.close();
+
+  char file[40];
+  snprintf(file, sizeof(file), "book_%u_%u.epub", (unsigned)srcSize, (unsigned)mtime);
+  const std::string target = cacheDirFor(fb2Path, cacheRoot) + "/" + file;
+  return Storage.exists(target.c_str()) ? target : std::string();
+}
+
 std::string Fb2::ensureEpub(const std::string& fb2Path, const std::string& cacheRoot, std::string* error,
                             void (*progress)(void* ctx, uint8_t pct), void* progressCtx) {
   if (error) error->clear();

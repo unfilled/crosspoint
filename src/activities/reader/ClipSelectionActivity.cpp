@@ -478,7 +478,28 @@ void ClipSelectionActivity::loop() {
   int touchX = 0;
   int touchY = 0;
   if (ignoreInitialTouch) {
-    if (!mappedInput.isScreenTouchHeld(touchX, touchY)) ignoreInitialTouch = false;
+    if (!mappedInput.isScreenTouchHeld(touchX, touchY)) {
+      ignoreInitialTouch = false;
+      // The opening long-press released over its word: with a default action
+      // configured, run it instead of showing the action row (the same rule
+      // the release branch applies to taps inside a live activity).
+      if (rangeStart == selected && mode != Mode::DefinitionLookup) {
+        switch (SETTINGS.selectionDefaultAction) {
+          case CrossPointSettings::SELECTION_LOOKUP:
+            confirmSelection(ClippingResult::Action::Lookup);
+            return;
+          case CrossPointSettings::SELECTION_CLIP:
+            confirmSelection(ClippingResult::Action::Clip);
+            return;
+          case CrossPointSettings::SELECTION_BOOKMARK:
+            confirmSelection(ClippingResult::Action::Bookmark);
+            return;
+          case CrossPointSettings::SELECTION_ASK:
+          default:
+            break;
+        }
+      }
+    }
     return;
   }
   if (!touchDragSelecting && mappedInput.wasScreenTapped(touchX, touchY)) {
@@ -536,9 +557,31 @@ void ClipSelectionActivity::loop() {
       }
       return;
     }
+    // Release without movement over a single word = a (short or long) word
+    // tap. With a default action configured, run it instead of showing the
+    // action row. Releases that moved (phrase drag) and multi-word selections
+    // (a handle grab makes rangeStart != selected) keep the row, as does the
+    // definition-lookup flow.
+    const bool stationaryWordTap = !touchDragHasMoved && rangeStart == selected && mode != Mode::DefinitionLookup;
     touchDragSelecting = false;
     touchDragHasMoved = false;
     touchDragPageEndIndex = -1;
+    if (stationaryWordTap) {
+      switch (SETTINGS.selectionDefaultAction) {
+        case CrossPointSettings::SELECTION_LOOKUP:
+          confirmSelection(ClippingResult::Action::Lookup);
+          return;
+        case CrossPointSettings::SELECTION_CLIP:
+          confirmSelection(ClippingResult::Action::Clip);
+          return;
+        case CrossPointSettings::SELECTION_BOOKMARK:
+          confirmSelection(ClippingResult::Action::Bookmark);
+          return;
+        case CrossPointSettings::SELECTION_ASK:
+        default:
+          break;
+      }
+    }
     requestUpdate();
     return;
   } else if (mappedInput.wasScreenTouchPressed(touchX, touchY)) {

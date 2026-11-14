@@ -181,6 +181,11 @@ void forEachBaseSetting(SettingVisitor visit, void* context) {
                           StrId::STR_LONG_PRESS_BEHAVIOR_ORIENTATION},
                          "longPressButtonBehavior", StrId::STR_CAT_CONTROLS));
   emit(buildLongPressMenuSetting());
+  if (BoardConfig::hasTouch())
+    emit(SettingInfo::Enum(StrId::STR_WORD_TAP_ACTION, &CrossPointSettings::selectionDefaultAction,
+                           {StrId::STR_ASK_EVERY_TIME, StrId::STR_LOOKUP, StrId::STR_CLIP,
+                            StrId::STR_BOOKMARK_OPTION},
+                           "selectionDefaultAction", StrId::STR_CAT_READER));
   // Double-click power frontlight shortcut only exists on the X4 Pro.
   if (BoardConfig::isX4Pro())
     emit(SettingInfo::Toggle(StrId::STR_DBL_CLICK_PWR_LIGHT, &CrossPointSettings::doubleClickPwrLight,

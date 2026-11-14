@@ -20,4 +20,9 @@ class Fb2 {
   static std::string ensureEpub(const std::string& fb2Path, const std::string& cacheRoot,
                                 std::string* error = nullptr,
                                 void (*progress)(void* ctx, uint8_t pct) = nullptr, void* progressCtx = nullptr);
+
+  // Path of the already-converted synthetic EPUB, or "" when it is not cached.
+  // Never converts: callers that must not block (home covers after a cache
+  // wipe) use this and simply live without a cover until the book is opened.
+  static std::string cachedEpub(const std::string& fb2Path, const std::string& cacheRoot);
 };

@@ -1078,9 +1078,12 @@ bool isLibraryBookFile(const std::string_view path) {
     if (slash == std::string_view::npos) break;
     start = slash + 1;
   }
+  // FB2 is excluded on purpose (this fork): metadata extraction per book made
+  // the shelf build crawl on libraries with thousands of .fb2 files, and the
+  // reader's own workflow is file-browser-first. FB2 books still open and read
+  // normally — they are just not shelf-indexed.
   return FsHelpers::checkFileExtension(path, ".epub") || FsHelpers::checkFileExtension(path, ".txt") ||
-         FsHelpers::checkFileExtension(path, ".md") || FsHelpers::hasXtcExtension(path) ||
-         FsHelpers::hasFb2Extension(path);
+         FsHelpers::checkFileExtension(path, ".md") || FsHelpers::hasXtcExtension(path);
 }
 
 bool markLibraryIndexDirty() {

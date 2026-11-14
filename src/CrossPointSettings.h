@@ -342,6 +342,11 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Long-press Confirm function in EPUB reader (cycles through LONG_PRESS_MENU_FUNCTION values).
   // Defaults to Disabled so shortcut-based bookmark toggling remains opt-in.
   uint8_t longPressMenuFunction = LP_MENU_DISABLED;
+  // Touch word-tap action in the reader: ask (show the Lookup/Clip/Bookmark
+  // row) or run one of them immediately on tap. Long-press phrase selection
+  // always shows the action row regardless of this setting.
+  enum SELECTION_DEFAULT_ACTION { SELECTION_ASK = 0, SELECTION_LOOKUP, SELECTION_CLIP, SELECTION_BOOKMARK };
+  uint8_t selectionDefaultAction = SELECTION_ASK;
   // UI Theme
   uint8_t uiTheme = LYRA;
   // Sunlight fading compensation

@@ -208,6 +208,19 @@ void FileBrowserActivity::onEnter() {
     return;
   }
 
+  // Resume where the user last browsed/opened a book (this fork): only when
+  // launched with the default root path — explicit paths (e.g. returning from
+  // the image viewer) keep their own target.
+  bool resumeSelection = false;
+  if (mode == Mode::Books && basepath == "/" && !APP_STATE.browserLastPath.empty()) {
+    auto saved = Storage.open(APP_STATE.browserLastPath.c_str());
+    if (saved && saved.isDirectory()) {
+      basepath = APP_STATE.browserLastPath;
+      resumeSelection = !APP_STATE.browserLastEntry.empty();
+    }
+    saved.close();
+  }
+
   auto root = Storage.open(basepath.c_str());
   if (!root) {
     basepath = "/";
@@ -223,11 +236,27 @@ void FileBrowserActivity::onEnter() {
     nav.selected = static_cast<int>(findEntry(fileName));
   } else {
     loadFiles();
+    if (resumeSelection) {
+      nav.selected = static_cast<int>(findEntry(APP_STATE.browserLastEntry));
+    }
   }
 }
 
 void FileBrowserActivity::onExit() {
   Activity::onExit();
+
+  // Remember the browsed folder and the highlighted entry (the exact book
+  // open saves its own snapshot; this covers leaving without opening).
+  if (mode == Mode::Books && !basepath.empty()) {
+    const std::string entry =
+        (nav.selected >= 0 && nav.selected < static_cast<int>(files.size())) ? files[nav.selected] : "";
+    if (APP_STATE.browserLastPath != basepath || APP_STATE.browserLastEntry != entry) {
+      APP_STATE.browserLastPath = basepath;
+      APP_STATE.browserLastEntry = entry;
+      APP_STATE.saveToFile();
+    }
+  }
+
   files.clear();
   fileNameBuffer.reset();
 }
@@ -370,6 +399,12 @@ void FileBrowserActivity::activateSelected() {
     requestUpdate();
   } else {
     const std::string fullPath = basepath + entry;
+    // Snapshot the exact spot the book was opened from (this fork's resume).
+    if (mode == Mode::Books) {
+      APP_STATE.browserLastPath = basepath;
+      APP_STATE.browserLastEntry = entry;
+      APP_STATE.saveToFile();
+    }
     lock.unlock();  // onSelectBook launches an activity; don't hold the lock across it
     onSelectBook(fullPath);
   }
