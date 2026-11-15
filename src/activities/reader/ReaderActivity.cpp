@@ -19,6 +19,7 @@
 #include "SdCardFontSystem.h"
 #include "XtcReaderActivity.h"
 #include "util/PluginEvents.h"
+#include "util/ReadingStats.h"
 
 ReaderActivity::ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
                                std::string bookPath, const bool allowFastInitialRefresh)
@@ -126,6 +127,12 @@ void ReaderActivity::onExit() {
 void ReaderActivity::prepareForSleep() { flushReaderSession(); }
 
 void ReaderActivity::flushReaderSession() {
+  // Reading statistics get every emit-worthy session, with or without plugin
+  // subscribers; the store decides durability, plugins only get events.
+  if (readerSession.isEmitWorthy()) {
+    READING_STATS.addSession(bookPath, readerSession.startTime(), readerSession.durationSeconds(),
+                             readerSession.startProgressBp(), readerSession.endProgressBp());
+  }
   if (!readerSession.isEmitWorthy() || !pluginevents::anySubscriber(pluginevents::Event::ReaderSession)) {
     readerSession.reset();
     return;

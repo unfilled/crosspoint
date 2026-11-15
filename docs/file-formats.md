@@ -728,3 +728,34 @@ Book moves rename the store and its `.deleted` journal (plus recovery sidecars)
 together. The stored source path is informational and is refreshed on the next
 save; the current file path selects the store. Local book deletion cleans up all
 of these sidecars but preserves the independent `My Clippings.txt` export.
+
+## RSB1 — reading statistics (`/.crosspoint/reading_stats.bin`)
+
+Written by `src/util/ReadingStats.cpp` from
+`ReaderActivity::flushReaderSession()` (reader exit and sleep), read by
+`ReadingStatsActivity`. One record per completed reading session — the same
+"emit-worthy" bar the plugin event uses: trusted wall clock and at least
+~10 s of active page dwell.
+
+### Version 1
+
+Header (8 bytes): magic `"RSB1"` + u32 format version, little-endian.
+An unknown header is discarded (the next append rewrites from scratch);
+there is no migration machinery yet.
+
+Records: 20-byte fixed part + path bytes, all little-endian:
+
+```text
+[i64 startEpoch]      trusted Unix time of session start
+[u32 durationSec]     active reading time (dwell-clamped per page)
+[u16 startProgressBp] book progress at session start, 0..10000
+[u16 endProgressBp]   book progress at session end, 0..10000
+[u16 pathLen]         bytes in the path field (1..512)
+[u16 reserved]        0
+[pathLen bytes]       book path, UTF-8, no terminator
+```
+
+The HAL has no append-mode open, so every append or rename is a stream-rewrite
+through a sibling `.tmp` file; a torn tail record (power loss mid-rewrite) is
+dropped on read, earlier records survive. Book renames re-point stored paths;
+deleting a book keeps its history rows.
