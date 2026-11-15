@@ -9,6 +9,8 @@
 
 #include <expat.h>
 
+#include <cstddef>
+
 // clang-format off
 
 // Windows-1251 (CP1251) bytes 0x80-0xFF → Unicode codepoints
@@ -142,4 +144,102 @@ inline int XMLCALL fb2UnknownEncodingHandler(void*, const XML_Char* name, XML_En
     return XML_STATUS_OK;
   }
   return XML_STATUS_ERROR;
+}
+
+// Mislabeled-encoding heuristic for the first bytes of an FB2 file. Real-world
+// files sometimes declare UTF-8 (or declare nothing, which expat defaults to
+// UTF-8) while actually being windows-1251 / KOI8-R; expat would then die on
+// the first Cyrillic byte. Returns the encoding name to force as the protocol
+// encoding (XML_SetEncoding wins over the XML declaration and routes through
+// fb2UnknownEncodingHandler), or nullptr to trust the file.
+//
+// The byte test: valid UTF-8 Cyrillic is a stream of D0/D1 lead bytes with
+// 0x80-0xBF continuations, while legacy 8-bit text is a stream of standalone
+// high bytes that fail UTF-8 validation. When legacy wins, the dominant
+// letter range names the encoding: cp1251 lowercase lives at 0xE0-0xFF,
+// KOI8-R lowercase at 0xC0-0xDF, and body text is mostly lowercase. Ties go
+// to windows-1251, far more common in the wild.
+inline const char* fb2SniffMislabeledEncoding(const char* buf, const size_t len) {
+  if (len < 64) return nullptr;
+  const auto* b = reinterpret_cast<const unsigned char*>(buf);
+
+  // A BOM is decisive: trust it.
+  if ((b[0] == 0xEF && b[1] == 0xBB) || (b[0] == 0xFF && b[1] == 0xFE) || (b[0] == 0xFE && b[1] == 0xFF)) {
+    return nullptr;
+  }
+
+  // Declared encoding: only UTF-8 (or a missing declaration) can be the lie;
+  // anything else already routes through the unknown-encoding handler.
+  {
+    const size_t headLen = len < 512 ? len : 512;
+    for (size_t i = 0; i + 8 <= headLen; ++i) {
+      auto lower = [](const unsigned char c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
+      static constexpr char kKey[] = "encoding";
+      size_t k = 0;
+      while (k < 8 && lower(b[i + k]) == kKey[k]) ++k;
+      if (k < 8) continue;
+      size_t j = i + 8;
+      while (j < headLen && (b[j] == ' ' || b[j] == '\t')) ++j;
+      // Not shaped like an attribute: let the byte heuristic decide below.
+      if (j >= headLen || b[j] != '=') break;
+      ++j;
+      while (j < headLen && (b[j] == ' ' || b[j] == '\t')) ++j;
+      if (j >= headLen || (b[j] != '"' && b[j] != '\'')) break;
+      const unsigned char quote = b[j++];
+      char value[16];
+      size_t v = 0;
+      while (j < headLen && b[j] != quote && v + 1 < sizeof(value)) value[v++] = (char)lower(b[j++]);
+      value[v] = '\0';
+      if (!fb2EncodingNameEquals(value, "utf-8") && !fb2EncodingNameEquals(value, "utf8")) {
+        return nullptr;  // declared legacy: the handler deals with it
+      }
+      break;  // declared UTF-8: verify against the bytes below
+    }
+  }
+
+  int validUtf8 = 0;
+  int bare = 0;
+  int rangeC0DF = 0;
+  int rangeE0FF = 0;
+  for (size_t i = 0; i < len;) {
+    const unsigned char c = b[i];
+    if (c < 0x80) {
+      ++i;
+      continue;
+    }
+    int need = 0;
+    if (c >= 0xC2 && c <= 0xDF) {
+      need = 1;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      need = 2;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+      need = 3;
+    }
+    bool ok = false;
+    if (need > 0 && i + need < len) {
+      ok = true;
+      for (int k = 1; k <= need; ++k) {
+        if ((b[i + k] & 0xC0) != 0x80) {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (ok) {
+      ++validUtf8;
+      i += (size_t)need + 1;
+      continue;
+    }
+    ++bare;
+    if (c >= 0xC0 && c <= 0xDF) {
+      ++rangeC0DF;
+    } else if (c >= 0xE0) {
+      ++rangeE0FF;
+    }
+    ++i;
+  }
+  // A genuinely UTF-8 sample has a few stray bad bytes at most; a legacy one
+  // is overwhelmingly bare high bytes.
+  if (bare < 8 || bare < validUtf8 * 4) return nullptr;
+  return rangeC0DF > rangeE0FF * 2 ? "koi8-r" : "windows-1251";
 }

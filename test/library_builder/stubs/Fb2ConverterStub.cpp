@@ -4,7 +4,8 @@
 #include <Fb2Converter.h>
 #include <string>
 
-bool Fb2Converter::readMetadata(const std::string&, fb2passes::Metadata&, std::string&) {
+bool Fb2Converter::readMetadata(const std::string&, fb2passes::Metadata&, std::string&, void (*)(void*, uint64_t),
+                                void*) {
   return false;
 }
 

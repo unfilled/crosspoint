@@ -64,3 +64,50 @@ TEST(Fb2Encoding, UnknownEncodingStillRejected) {
   EXPECT_TRUE(parseWithEncoding(R"(<?xml version="1.0" encoding="iso-8859-5"?>)", "\xC0")
                   .rfind("PARSE_ERROR", 0) == 0);
 }
+
+namespace {
+
+// Builds a file head: optional XML declaration + `unit` repeated to ~2 KB.
+std::string sniffSample(const char* decl, const std::string& unit) {
+  std::string s = decl;
+  while (s.size() < 2000) s += unit;
+  return s;
+}
+
+}  // namespace
+
+TEST(Fb2EncodingSniff, MislabeledCp1251ForcedToWindows1251) {
+  // cp1251 "слово " = F1 EB EE E2 20: every letter fails UTF-8 validation.
+  const std::string sample = sniffSample(R"(<?xml version="1.0" encoding="UTF-8"?>)", "\xF1\xEB\xEE\xE2\x20");
+  EXPECT_STREQ(fb2SniffMislabeledEncoding(sample.data(), sample.size()), "windows-1251");
+}
+
+TEST(Fb2EncodingSniff, GenuineUtf8KeepsDeclaration) {
+  // Real UTF-8 Russian: D0/D1 leads with continuations — nothing to override.
+  const std::string sample =
+      sniffSample(R"(<?xml version="1.0" encoding="UTF-8"?>)", "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82 ");
+  EXPECT_EQ(fb2SniffMislabeledEncoding(sample.data(), sample.size()), nullptr);
+}
+
+TEST(Fb2EncodingSniff, HonestlyDeclaredLegacyLeftAlone) {
+  // Declared windows-1251 with matching bytes: the unknown-encoding handler
+  // already covers it; the sniffer must not interfere.
+  const std::string sample = sniffSample(R"(<?xml version="1.0" encoding="windows-1251"?>)", "\xF1\xEB\xEE\xE2\x20");
+  EXPECT_EQ(fb2SniffMislabeledEncoding(sample.data(), sample.size()), nullptr);
+}
+
+TEST(Fb2EncodingSniff, MislabeledKoi8DetectedByLetterRange) {
+  // KOI8-R "опасен " = CF D0 C1 D3 C5 CE 20: lowercase at 0xC0-0xDF names it.
+  const std::string sample = sniffSample(R"(<?xml version="1.0" encoding="UTF-8"?>)", "\xCF\xD0\xC1\xD3\xC5\xCE\x20");
+  EXPECT_STREQ(fb2SniffMislabeledEncoding(sample.data(), sample.size()), "koi8-r");
+}
+
+TEST(Fb2EncodingSniff, BomOutranksHeuristic) {
+  const std::string sample = sniffSample("\xEF\xBB\xBF", "\xF1\xEB\xEE\xE2\x20");
+  EXPECT_EQ(fb2SniffMislabeledEncoding(sample.data(), sample.size()), nullptr);
+}
+
+TEST(Fb2EncodingSniff, TinySampleNotJudged) {
+  const std::string sample = "\xF1\xEB\xEE\xE2\x20\xF1\xEB\xEE\xE2\x20";
+  EXPECT_EQ(fb2SniffMislabeledEncoding(sample.data(), sample.size()), nullptr);
+}

@@ -30,6 +30,25 @@ bool parseFile(const std::string& path, XML_Parser p, std::string& error, const 
     error = "cannot open file";
     return false;
   }
+  // Mislabeled-encoding guard: a cp1251/KOI8-R file claiming UTF-8 would die
+  // on the first Cyrillic byte; force the protocol encoding when the first
+  // bytes say the declaration lies (see Fb2Encoding.h). Runs for every pass;
+  // the extra 2 KB read per pass is noise next to the full parse.
+  {
+    char sniff[2048];
+    const int sn = f.read(sniff, sizeof(sniff));
+    if (sn < 0 || (sn > 0 && !f.seekSet(0))) {
+      error = "read error";
+      f.close();
+      return false;
+    }
+    if (sn > 0) {
+      if (const char* forced = fb2SniffMislabeledEncoding(sniff, static_cast<size_t>(sn))) {
+        LOG_INF("FB2", "mislabeled UTF-8 declaration; forcing %s", forced);
+        XML_SetEncoding(p, forced);
+      }
+    }
+  }
   // Heap, not static: conversion-time memory the reader gets back afterwards.
   const std::unique_ptr<char[]> buf(new (std::nothrow) char[kReadChunk]);
   if (!buf) {
