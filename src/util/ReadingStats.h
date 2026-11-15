@@ -5,7 +5,7 @@
 //
 // Sessions are recorded from ReaderActivity::flushReaderSession() (the same
 // place that feeds the plugin event), so only "emit-worthy" sessions land
-// here: wall-clock time was trusted and at least ~10 s of active page dwell
+// here: wall-clock time was trusted and at least ~10 s of reading time
 // accumulated. Page-level granularity stays inside ReaderSession; this store
 // keeps one row per flush (reader exit / sleep).
 //

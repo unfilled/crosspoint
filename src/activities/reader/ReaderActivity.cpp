@@ -127,6 +127,9 @@ void ReaderActivity::onExit() {
 void ReaderActivity::prepareForSleep() { flushReaderSession(); }
 
 void ReaderActivity::flushReaderSession() {
+  // Credit the still-open page first: it has no following turn, so without
+  // this its dwell would be dropped on every exit/sleep flush.
+  readerSession.finalize(millis());
   // Reading statistics get every emit-worthy session, with or without plugin
   // subscribers; the store decides durability, plugins only get events.
   if (readerSession.isEmitWorthy()) {

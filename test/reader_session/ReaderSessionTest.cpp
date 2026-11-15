@@ -15,10 +15,40 @@ void turnAndRender(ReaderSession& session, bool forward, bool succeeded, uint32_
   session.onRenderComplete(ms, epoch, progress);
 }
 
-TEST(ReaderSession, IgnoresDwellsUnderTwoSeconds) {
+TEST(ReaderSession, CountsShortDwellsBelowTwoSeconds) {
   ReaderSession session;
   anchor(session, 1000, 100, 1000);
   turnAndRender(session, true, true, 2999, 102, 1100);
+
+  EXPECT_EQ(session.durationSeconds(), 1u);
+  EXPECT_EQ(session.startTime(), 100);
+}
+
+TEST(ReaderSession, FinalizeCreditsOpenPageOnce) {
+  ReaderSession session;
+  anchor(session, 1000, 100, 1000);
+  turnAndRender(session, true, true, 6000, 105, 1100);  // 5s credited by the turn
+  session.finalize(20000);                              // 14s on the still-open page
+  session.finalize(20000);                              // a repeated flush must not double-count
+
+  EXPECT_EQ(session.durationSeconds(), 19u);
+  EXPECT_TRUE(session.isEmitWorthy());
+}
+
+TEST(ReaderSession, FinalizeAloneCanMakeSessionEmitWorthy) {
+  ReaderSession session;
+  anchor(session, 1000, 100, 1000);
+  session.finalize(15000);
+
+  EXPECT_EQ(session.startTime(), 100);
+  EXPECT_EQ(session.durationSeconds(), 14u);
+  EXPECT_TRUE(session.isEmitWorthy());
+}
+
+TEST(ReaderSession, FinalizeIgnoresUntrustedAnchor) {
+  ReaderSession session;
+  anchor(session, 1000, 0, 1000);
+  session.finalize(60000);
 
   EXPECT_EQ(session.durationSeconds(), 0u);
   EXPECT_FALSE(session.isEmitWorthy());
