@@ -3,6 +3,7 @@
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalMemory.h>
+#include <Utf8.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -14,6 +15,8 @@
 
 namespace {
 
+// Auto-dismiss window for NotFound only; error popups stay until Back so the
+// message can actually be read.
 constexpr unsigned long POPUP_DURATION_MS = 1500;
 // Definitions longer than this are truncated with an ellipsis line.
 constexpr size_t MAX_DEFINITION_BYTES = 12 * 1024;
@@ -78,7 +81,10 @@ void DictionaryPopupActivity::performLookup() {
     if (auto* fcm = renderer.getFontCacheManager()) fcm->releaseSdFontCaches();
     if (isHtml) definition = htmlToPlainText(definition, DICTIONARY_PLAIN_HEADWORD_MARKER);
     if (definition.size() > MAX_DEFINITION_BYTES) {
-      definition.resize(MAX_DEFINITION_BYTES);
+      // Back the byte cap off to a codepoint boundary: a raw resize can cut
+      // mid-sequence and leave invalid UTF-8 for the wrapper/renderer.
+      definition.resize(static_cast<size_t>(
+          utf8SafeTruncateBuffer(definition.c_str(), static_cast<int>(MAX_DEFINITION_BYTES))));
       definition += "\n…";
     }
     definition.erase(std::remove(definition.begin(), definition.end(), DICTIONARY_PLAIN_HEADWORD_MARKER),
@@ -148,7 +154,13 @@ void DictionaryPopupActivity::loop() {
     return;
   }
   if (phase != Phase::Show) {
-    if ((popup == Popup::NotFound || popup == Popup::Error) && millis() - popupTime >= POPUP_DURATION_MS) {
+    // Back closes any lookup-phase popup (NotFound/Error); without this the
+    // base-class input handling never runs in this phase.
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      finish();
+      return;
+    }
+    if (popup == Popup::NotFound && millis() - popupTime >= POPUP_DURATION_MS) {
       finish();
     }
     return;
